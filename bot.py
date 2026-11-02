@@ -51,7 +51,7 @@ DB_PATH = env("DB_PATH", "files.db")
 START_TEXT = env(
     "START_TEXT",
     "Namaste {mention}! 👋\n\n"
-    "Main <b>{bot_name}</b> hu. Jis kitab ki file chahiye uska <b>naam</b> bhejo, "
+    "Main <b>{bot_name}</b> hu. Jis Movie ki file chahiye uska <b>naam</b> bhejo, "
     "main dhoondh kar bhej dunga.\n\n"
     "⏳ Files {minutes} minute baad auto-delete ho jati hain, isliye save kar lena.",
 ).replace("\\n", "\n")
