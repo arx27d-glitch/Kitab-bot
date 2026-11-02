@@ -35,7 +35,7 @@ START_TIME = time.time()
 
 
 # ----------------------------------------------------------------------------
-# CONFIG (sab kuch environment variables se aata hai, .env.example dekho)
+# CONFIGURATION (All settings are loaded from environment variables)
 # ----------------------------------------------------------------------------
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
@@ -51,30 +51,31 @@ BOT_TOKEN = env("BOT_TOKEN")
 DB_CHANNEL = int(env("DB_CHANNEL", "0"))
 ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-").isdigit()]
 
-# Database: MONGO_URI do to data restart ke baad bhi bacha rahega (recommended)
+# Database: Set MONGO_URI to preserve data even after restarts (recommended)
 MONGO_URI = env("MONGO_URI")
 MONGO_DB_NAME = env("MONGO_DB_NAME", "bookbot")
-DB_PATH = env("DB_PATH", "files.db")  # sirf tab use hota hai jab MONGO_URI nahi diya
+DB_PATH = env("DB_PATH", "files.db")  # Used only when MONGO_URI is not provided
 
-# Auto-forward: in groups ke naye messages/files apne aap DB_CHANNEL me copy honge
+# Auto-forward: New messages/files from these groups will automatically be copied to DB_CHANNEL
 SOURCE_GROUPS = [int(x) for x in env("SOURCE_GROUPS").replace(",", " ").split() if x.lstrip("-").isdigit()]
-FORWARD_ALL = env_bool("FORWARD_ALL", "false")  # true = text bhi forward
+FORWARD_ALL = env_bool("FORWARD_ALL", "false")  # true = forward text messages too
 
-# Bot start hote hi DB channel ki files index ho jayengi
+# Automatically index files from the database channel when the bot starts
 AUTO_INDEX_ON_START = env_bool("AUTO_INDEX_ON_START", "true")
-# Agar bot DB channel me message nahi bhej sakta to scan ke liye last message id yahan do
+
+# If the bot cannot send messages to the database channel, provide the last message ID here
 DB_LAST_MESSAGE_ID = int(env("DB_LAST_MESSAGE_ID", "0") or 0)
 
 BOT_NAME = env("BOT_NAME", "MOVIE HUB 🎬 Bot")
 OWNER_USERNAME = env("OWNER_USERNAME").lstrip("@")
 SUPPORT_USERNAME = env("SUPPORT_USERNAME").lstrip("@")
 UPDATES_CHANNEL = env("UPDATES_CHANNEL").lstrip("@")
-START_PIC = env("START_PIC")  # optional: welcome photo (link ya file_id)
+START_PIC = env("START_PIC")  # Optional welcome photo (URL or file_id)
 
-AUTO_DELETE_SECONDS = int(env("AUTO_DELETE_SECONDS", "300"))  # 300 = 5 minute, 0 = off
+AUTO_DELETE_SECONDS = int(env("AUTO_DELETE_SECONDS", "300"))  # 300 = 5 minutes, 0 = disabled
 RESULTS_PER_PAGE = int(env("RESULTS_PER_PAGE", "8"))
 
-# Optional: apna text. {mention} {first_name} {bot_name} {minutes} use kar sakte ho
+# Optional custom text. Supported placeholders: {mention} {first_name} {bot_name} {minutes}
 START_TEXT_ENV = env("START_TEXT").replace("\\n", "\n")
 JOIN_TEXT_ENV = env("JOIN_TEXT").replace("\\n", "\n")
 
@@ -87,10 +88,10 @@ def parse_chat(value):
 
 
 def load_force_channels():
-    """CHANNEL_1 ... CHANNEL_10 padhta hai.
+    """Loads CHANNEL_1 ... CHANNEL_10.
 
-    CHANNEL_n      = @username  ya  -100xxxxxxxxxx (numeric id)
-    CHANNEL_n_LINK = invite link (private channel ke liye zaroori, public ke liye optional)
+    CHANNEL_n      = @username or -100xxxxxxxxxx (numeric ID)
+    CHANNEL_n_LINK = Invite link (required for private channels, optional for public channels)
     """
     channels = []
     for i in range(1, 11):
@@ -102,7 +103,7 @@ def load_force_channels():
         if not link and isinstance(ref, str):
             link = f"https://t.me/{ref}"
         if not link:
-            log.warning("CHANNEL_%s private hai, CHANNEL_%s_LINK bhi set karo.", i, i)
+            log.warning("CHANNEL_%s is private. Set CHANNEL_%s_LINK as well.", i, i)
         channels.append({"n": i, "ref": ref, "link": link})
     return channels
 
@@ -110,7 +111,7 @@ def load_force_channels():
 ENV_CHANNELS = load_force_channels()
 
 if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
-    raise SystemExit("API_ID, API_HASH, BOT_TOKEN aur DB_CHANNEL set karna zaroori hai (.env dekho).")
+    raise SystemExit("API_ID, API_HASH, BOT_TOKEN and DB_CHANNEL must be configured (.env).")
 
 app = Client(
     "bookbot",
@@ -126,8 +127,8 @@ if MONGO_URI:
 else:
     store = SqliteStore(DB_PATH)
     log.warning(
-        "MONGO_URI set nahi hai, SQLite use ho raha hai. Heroku/Railway/Render par restart ke baad "
-        "data mit sakta hai. Permanent data ke liye MONGO_URI do."
+        "MONGO_URI is not configured. SQLite is being used. Data may be lost after "
+        "restarts on Heroku/Railway/Render. Set MONGO_URI for permanent storage."
     )
 
 
@@ -207,7 +208,7 @@ _tasks = set()
 
 
 def schedule_delete(*messages: Message, delay: int = None):
-    """Messages ko `delay` seconds baad delete karta hai (auto-delete)."""
+    """Deletes messages after the specified delay (auto-delete)."""
     delay = AUTO_DELETE_SECONDS if delay is None else delay
     if delay <= 0:
         return
@@ -226,7 +227,7 @@ def schedule_delete(*messages: Message, delay: int = None):
 
 
 async def edit(msg: Message, text: str, kb=None):
-    """Text ya photo-caption wala message, dono ko edit karta hai."""
+    """Edits both text messages and photo-caption messages."""
     try:
         if msg.photo or msg.video or msg.animation or msg.document:
             await msg.edit_caption(text, reply_markup=kb)
@@ -237,7 +238,7 @@ async def edit(msg: Message, text: str, kb=None):
 
 
 # ----------------------------------------------------------------------------
-# PREMIUM UI: texts + buttons
+# PREMIUM UI: TEXTS AND BUTTONS
 # ----------------------------------------------------------------------------
 def welcome_text(user) -> str:
     if START_TEXT_ENV:
@@ -246,13 +247,13 @@ def welcome_text(user) -> str:
         body = (
             "✨ <b>{bot_name}</b> ✨\n"
             + LINE
-            + "\n👋 Namaste {mention}!\n\n"
-            "🎬 Kisi bhi Movie ya Series ka <b>naam</b> bhejo, main turant dhoondh kar file bhej dunga.\n\n"
+            + "\n👋 Hello {mention}!\n\n"
+            "🎬 Send me the <b>name</b> of any Movie or Series, and I will find and deliver the file instantly.\n\n"
             "┏ 🔍 <b>Fast Search</b>\n"
             "┣ 📥 <b>Instant Delivery</b>\n"
             "┗ ⏳ <b>Auto-delete</b>: {minutes} min\n"
             + LINE
-            + "\n💡 <i>Tip: chhota naam likho, jaise</i> <code>Coolie </code>"
+            + "\n💡 <i>Tip: Use a short name, for example</i> <code>Coolie </code>"
         )
     return body.format(
         mention=user.mention,
@@ -264,27 +265,27 @@ def welcome_text(user) -> str:
 
 def help_text(is_admin: bool) -> str:
     text = (
-        "🎬 <b>Kaise Use Kare</b>\n"
+        "🎬 <b>How To Use</b>\n"
         + LINE
-        + "\n1️⃣ Movie ka <b>naam</b> likh kar bhejo\n"
-        "2️⃣ Result list me se apni <b>file</b> chuno\n"
-        f"3️⃣ File milte hi <b>save ya forward</b> kar lo ({minutes()} min me delete ho jayegi)\n"
+        + "\n1️⃣ Enter the <b>Movie name</b>\n"
+        "2️⃣ Select your <b>file</b> from the results\n"
+        f"3️⃣ Save or forward the <b>file</b> after receiving it (it will be deleted after {minutes()} min)\n"
         + LINE
         + "\n💡 <b>Tips</b>\n"
-        "• Chhota aur simple naam likho\n"
-        "• Spelling ek baar check kar lo\n"
-        "• Movie/Series Name , jaise <code>KGF </code>"
+        "• Use short and simple names\n"
+        "• Check the spelling carefully\n"
+        "• Enter a Movie/Series name, for example <code>KGF </code>"
     )
     if is_admin:
         text += (
             "\n\n👑 <b>Admin Commands</b>\n"
             + LINE
-            + "\n/stats - bot statistics\n"
-            "/broadcast - sabko message (reply ya text ke saath)\n"
-            "/index - nayi files index karo (<code>/index full</code> = poora scan)\n"
-            "/addchannel - force-join channel jodo\n"
-            "/delchannel - channel hatao\n"
-            "/channels - channels ki list aur status"
+            + "\n/stats - View bot statistics\n"
+            "/broadcast - Send a message to all users (reply or provide text)\n"
+            "/index - Index new files (<code>/index full</code> = complete scan)\n"
+            "/addchannel - Add a force-join channel\n"
+            "/delchannel - Remove a channel\n"
+            "/channels - View the channel list and status"
         )
     return text
 
@@ -303,7 +304,7 @@ async def about_text() -> str:
         text += f"🤖 Bot: @{BOT_USERNAME}\n"
     if OWNER_USERNAME:
         text += f"👤 Owner: @{esc(OWNER_USERNAME)}\n"
-    text += LINE + "\n💙 <i>Padhte raho, aage badhte raho.</i>"
+    text += LINE + "\n💙 <i>Keep learning, keep growing.</i>"
     return text
 
 
@@ -319,7 +320,7 @@ def link_buttons():
 def home_keyboard():
     rows = [
         [
-            InlineKeyboardButton("🎬 Kaise Use Kare", callback_data="help"),
+            InlineKeyboardButton("🎬 How To Use", callback_data="help"),
             InlineKeyboardButton("ℹ️ About", callback_data="about"),
         ]
     ]
@@ -349,7 +350,7 @@ async def send_welcome(m: Message):
         try:
             return await m.reply_photo(START_PIC, caption=text, reply_markup=kb, quote=True)
         except Exception as e:
-            log.warning("START_PIC bhej nahi paya (%s), text bhej raha hu", e)
+            log.warning("Unable to send START_PIC (%s). Sending text instead.", e)
     return await m.reply(text, reply_markup=kb, quote=True, disable_web_page_preview=True)
 
 
@@ -357,10 +358,10 @@ async def send_welcome(m: Message):
 # FORCE JOIN
 # ----------------------------------------------------------------------------
 async def get_force_channels():
-    """Env wale channels + /addchannel se jode gaye channels (slot number se merge)."""
+    """Combines environment channels and channels added using /addchannel by slot number."""
     merged = {c["n"]: c for c in ENV_CHANNELS}
     for slot, ref, link in await store.get_channels():
-        if not ref:  # /delchannel se hataya gaya slot
+        if not ref:  # Slot removed using /delchannel
             merged.pop(slot, None)
             continue
         merged[slot] = {"n": slot, "ref": parse_chat(ref), "link": link}
@@ -377,13 +378,13 @@ async def not_joined(client: Client, user_id: int):
         except UserNotParticipant:
             missing.append(ch)
         except RPCError as e:
-            # Bot channel me admin nahi hai ya channel galat hai: user ko block mat karo
-            log.error("Channel %s check nahi hua (%s). Bot ko us channel me admin banao.", ch["ref"], e)
+            # If the bot is not an admin or the channel is invalid, do not block the user
+            log.error("Unable to check channel %s (%s). Make the bot an admin in that channel.", ch["ref"], e)
     return missing
 
 
 async def join_view(missing):
-    """(text, keyboard) - progress ke saath premium join screen."""
+    """Returns (text, keyboard) with a progress indicator for the premium join screen."""
     total = len(await get_force_channels())
     joined = max(total - len(missing), 0)
     if JOIN_TEXT_ENV:
@@ -392,21 +393,21 @@ async def join_view(missing):
         text = (
             "🔒 <b>Access Locked</b>\n"
             + LINE
-            + f"\nBot use karne ke liye neeche ke <b>{len(missing)}</b> channel(s) join karo.\n\n"
+            + f"\nJoin the following <b>{len(missing)}</b> channel(s) to use this bot.\n\n"
             f"📊 Progress: {progress_bar(joined, total)} <b>{joined}/{total}</b>\n"
             + LINE
-            + "\nJoin karne ke baad <b>✅ Maine Join Kar Liya</b> dabao."
+            + "\nAfter joining, press <b>✅ I Have Joined</b>."
         )
     rows = []
     for ch in missing:
         if ch["link"]:
             rows.append([InlineKeyboardButton(f"📢 Join Channel {ch['n']}  ↗", url=ch["link"])])
-    rows.append([InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="recheck")])
+    rows.append([InlineKeyboardButton("✅ I Have Joined", callback_data="recheck")])
     return text, InlineKeyboardMarkup(rows)
 
 
 # ----------------------------------------------------------------------------
-# INDEXING (file ka naam + file_id database me save hota hai)
+# INDEXING (File name and file_id are saved in the database)
 # ----------------------------------------------------------------------------
 async def index_message(m: Message) -> bool:
     media = m.document or m.video or m.audio
@@ -421,14 +422,14 @@ async def index_message(m: Message) -> bool:
     return True
 
 
-# DB channel me koi bhi nayi file aayegi to apne aap index hogi
+# Automatically index any new file posted in the database channel
 @app.on_message(filters.chat(DB_CHANNEL) & (filters.document | filters.video | filters.audio))
 async def index_file(_, m: Message):
     await index_message(m)
 
 
 # ----------------------------------------------------------------------------
-# AUTO FORWARD: SOURCE_GROUPS ke naye messages -> DB_CHANNEL (aur turant index)
+# AUTO FORWARD: New messages from SOURCE_GROUPS -> DB_CHANNEL (and index immediately)
 # ----------------------------------------------------------------------------
 if SOURCE_GROUPS:
 
@@ -440,7 +441,7 @@ if SOURCE_GROUPS:
 
         uid = media.file_unique_id if media else None
         if uid and await store.is_forwarded(uid):
-            return  # ye file pehle hi forward ho chuki hai
+            return  # This file has already been forwarded
 
         try:
             sent = await m.copy(DB_CHANNEL)
@@ -448,7 +449,7 @@ if SOURCE_GROUPS:
             await asyncio.sleep(e.value)
             sent = await m.copy(DB_CHANNEL)
         except Exception as e:
-            log.error("Auto-forward fail (group %s): %s", m.chat.id, e)
+            log.error("Auto-forward failed (group %s): %s", m.chat.id, e)
             return
 
         if uid:
@@ -457,16 +458,15 @@ if SOURCE_GROUPS:
 
 
 # ----------------------------------------------------------------------------
-# PURANI FILES INDEX KARNA (bot start se pehle jo files DB channel me thi)
-# Bots channel ki history seedha nahi padh sakte, isliye message id 1 se last id
-# tak batch me get_messages se scan kiya jata hai.
+# INDEX EXISTING FILES (Files already present in the DB channel before bot startup)
+# Bots cannot directly read channel history, so message IDs are scanned in batches.
 # ----------------------------------------------------------------------------
 _scan_lock = asyncio.Lock()
 
 
 async def get_last_message_id() -> int:
     try:
-        tmp = await app.send_message(DB_CHANNEL, "🔄 indexing...", disable_notification=True)
+        tmp = await app.send_message(DB_CHANNEL, "🔄 Indexing...", disable_notification=True)
         last_id = tmp.id
         try:
             await tmp.delete()
@@ -475,13 +475,13 @@ async def get_last_message_id() -> int:
         return last_id
     except Exception as e:
         if DB_LAST_MESSAGE_ID:
-            log.warning("DB channel me message nahi bhej paya (%s). DB_LAST_MESSAGE_ID use ho raha hai.", e)
+            log.warning("Unable to send a message to the DB channel (%s). Using DB_LAST_MESSAGE_ID.", e)
             return DB_LAST_MESSAGE_ID
-        raise RuntimeError(f"DB channel me message nahi bhej paya (bot admin hai?): {e}")
+        raise RuntimeError(f"Unable to send a message to the DB channel (is the bot an admin?): {e}")
 
 
 async def scan_db_channel(full: bool = False, progress=None):
-    """(found, last_id) return karta hai. full=True = shuru se poora scan."""
+    """Returns (found, last_id). full=True means scan the entire channel."""
     async with _scan_lock:
         last_id = await get_last_message_id()
         start = 1 if full else int(await store.get_meta("last_scanned", "0")) + 1
@@ -501,7 +501,7 @@ async def scan_db_channel(full: bool = False, progress=None):
             await asyncio.sleep(0.5)
 
         await store.set_meta("last_scanned", str(last_id))
-        log.info("Scan khatam: %s files index hui (last id %s)", found, last_id)
+        log.info("Scan completed: %s files indexed (last ID %s)", found, last_id)
         return found, last_id
 
 
@@ -531,7 +531,7 @@ async def stats_cmd(_, m: Message):
     files = await store.count_files()
     users = await store.count_users()
     channels = len(await get_force_channels())
-    kind = "MongoDB ✅ (permanent)" if store.persistent else "SQLite ⚠️ (restart par mit sakta hai)"
+    kind = "MongoDB ✅ (permanent)" if store.persistent else "SQLite ⚠️ (may be lost after restart)"
     await m.reply(
         "📊 <b>Bot Statistics</b>\n"
         + LINE
@@ -539,7 +539,7 @@ async def stats_cmd(_, m: Message):
         f"👥 Users: <b>{users}</b>\n"
         f"📢 Force-join channels: <b>{channels}</b>\n"
         f"🔗 Auto-forward groups: <b>{len(SOURCE_GROUPS)}</b>\n"
-        f"⏳ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'band'}"
+        f"⏳ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'disabled'}"
         f"{' min' if AUTO_DELETE_SECONDS > 0 else ''}</b>\n"
         f"💾 Database: {kind}\n"
         f"⏱ Uptime: <b>{fmt_uptime(time.time() - START_TIME)}</b>\n"
@@ -556,8 +556,8 @@ async def broadcast_cmd(client: Client, m: Message):
         return await m.reply(
             "📢 <b>Broadcast</b>\n"
             + LINE
-            + "\nKisi message par <b>reply</b> karke <code>/broadcast</code> likho,\n"
-            "ya seedha: <code>/broadcast aapka message</code>",
+            + "\nReply to any message with <b>/broadcast</b>,\n"
+            "or send directly: <code>/broadcast your message</code>",
             quote=True,
         )
 
@@ -569,7 +569,7 @@ async def broadcast_cmd(client: Client, m: Message):
 
     user_ids = await store.all_user_ids()
     total = len(user_ids)
-    status = await m.reply(f"📢 Broadcast shuru... <b>{total}</b> users", quote=True)
+    status = await m.reply(f"📢 Broadcast started... <b>{total}</b> users", quote=True)
     ok = blocked = fail = 0
     last_edit = time.time()
 
@@ -583,7 +583,7 @@ async def broadcast_cmd(client: Client, m: Message):
             ok += 1
         except (UserIsBlocked, InputUserDeactivated, PeerIdInvalid):
             blocked += 1
-            await store.delete_user(uid)  # jo bot block kar chuke unhe list se hatao
+            await store.delete_user(uid)  # Remove users who have blocked the bot
         except Exception:
             fail += 1
 
@@ -591,7 +591,7 @@ async def broadcast_cmd(client: Client, m: Message):
             last_edit = time.time()
             try:
                 await status.edit_text(
-                    f"📢 Broadcast chal raha hai...\n{progress_bar(i, total)} <b>{i}/{total}</b>"
+                    f"📢 Broadcast in progress...\n{progress_bar(i, total)} <b>{i}/{total}</b>"
                 )
             except Exception:
                 pass
@@ -600,8 +600,8 @@ async def broadcast_cmd(client: Client, m: Message):
     await status.edit_text(
         "✅ <b>Broadcast Complete</b>\n"
         + LINE
-        + f"\n📨 Bhej diye: <b>{ok}</b>\n"
-        f"🚫 Blocked/Deleted (list se hataye): <b>{blocked}</b>\n"
+        + f"\n📨 Successfully sent: <b>{ok}</b>\n"
+        f"🚫 Blocked/Deleted (removed from list): <b>{blocked}</b>\n"
         f"⚠️ Failed: <b>{fail}</b>"
     )
 
@@ -609,7 +609,7 @@ async def broadcast_cmd(client: Client, m: Message):
 @app.on_message(filters.command("index") & filters.private & filters.user(ADMINS))
 async def index_cmd(_, m: Message):
     full = len(m.command) > 1 and m.command[1].lower() == "full"
-    status = await m.reply("⏳ DB channel scan ho raha hai, thoda wait karo...", quote=True)
+    status = await m.reply("⏳ Scanning the DB channel. Please wait...", quote=True)
     last_edit = [0.0]
 
     async def progress(done, total, found):
@@ -618,8 +618,8 @@ async def index_cmd(_, m: Message):
         last_edit[0] = time.time()
         try:
             await status.edit_text(
-                f"⏳ Scan chal raha hai...\n{progress_bar(done, total)} <b>{done}/{total}</b>\n"
-                f"🎬 Mili files: <b>{found}</b>"
+                f"⏳ Scan in progress...\n{progress_bar(done, total)} <b>{done}/{total}</b>\n"
+                f"🎬 Files found: <b>{found}</b>"
             )
         except Exception:
             pass
@@ -628,27 +628,27 @@ async def index_cmd(_, m: Message):
         found, last_id = await scan_db_channel(full=full, progress=progress)
     except Exception as e:
         return await status.edit_text(
-            f"❌ <b>Scan fail</b>\n{esc(e)}\n\nBot DB channel me admin hai aur post kar sakta hai? Check karo."
+            f"❌ <b>Scan Failed</b>\n{esc(e)}\n\nMake sure the bot is an admin in the DB channel and has permission to post messages."
         )
     total = await store.count_files()
     await status.edit_text(
         "✅ <b>Scan Complete</b>\n"
         + LINE
-        + f"\n📥 Is baar mili: <b>{found}</b> files\n"
-        f"🎬 Total indexed: <b>{total}</b>\n"
-        f"🆔 Last message id: <code>{last_id}</code>"
+        + f"\n📥 Files found this time: <b>{found}</b>\n"
+        f"🎬 Total indexed files: <b>{total}</b>\n"
+        f"🆔 Last message ID: <code>{last_id}</code>"
     )
 
 
 ADDCHANNEL_USAGE = (
-    "➕ <b>Force-Join Channel Jodo</b>\n"
+    "➕ <b>Add Force-Join Channel</b>\n"
     + LINE
     + "\n<code>/addchannel 1 @username</code>\n"
     "<code>/addchannel 2 -1001234567890</code>\n"
     "<code>/addchannel 3 -1001234567890 https://t.me/+InviteLink</code>\n"
-    "<code>/addchannel @username</code> (khali slot me apne aap lagega)\n\n"
-    "Slot 1 se 10 tak. Same slot par dobara dalne se purana channel replace ho jata hai.\n"
-    "Bot us channel me <b>admin</b> hona chahiye."
+    "<code>/addchannel @username</code> (automatically uses an available slot)\n\n"
+    "Slots range from 1 to 10. Adding another channel to the same slot replaces the previous one.\n"
+    "The bot must be an <b>admin</b> in that channel."
 )
 
 
@@ -665,12 +665,12 @@ async def addchannel_cmd(client: Client, m: Message):
         slot = next((i for i in range(1, 11) if i not in used), None)
         if slot is None:
             return await m.reply(
-                "⚠️ Saare 10 slot bhar chuke hain. Slot number dekar replace karo ya /delchannel use karo.",
+                "⚠️ All 10 slots are occupied. Specify a slot to replace a channel or use /delchannel.",
                 quote=True,
             )
         rest = args
     if not 1 <= slot <= 10:
-        return await m.reply("⚠️ Slot 1 se 10 ke beech hona chahiye.", quote=True)
+        return await m.reply("⚠️ Slot number must be between 1 and 10.", quote=True)
 
     ref = parse_chat(rest[0])
     link = rest[1] if len(rest) > 1 else ""
@@ -679,7 +679,7 @@ async def addchannel_cmd(client: Client, m: Message):
         chat = await client.get_chat(ref)
     except Exception as e:
         return await m.reply(
-            f"❌ <b>Channel nahi mila</b>\n{esc(e)}\n\nPehle bot ko us channel me <b>admin</b> banao, phir command dobara chalao.",
+            f"❌ <b>Channel Not Found</b>\n{esc(e)}\n\nMake the bot an <b>admin</b> in that channel first, then run the command again.",
             quote=True,
         )
 
@@ -703,16 +703,16 @@ async def addchannel_cmd(client: Client, m: Message):
 
     note = ""
     if not is_admin:
-        note += "\n⚠️ Bot is channel me admin nahi dikh raha, join check tabhi chalega jab admin banega."
+        note += "\n⚠️ The bot does not appear to be an admin in this channel. Join verification will only work after the bot becomes an admin."
     if not link:
-        note += "\n⚠️ Private channel hai aur link nahi mila. Command ke end me invite link bhi do."
+        note += "\n⚠️ No invite link was found for this private channel. Provide the invite link at the end of the command."
     await m.reply(
-        "✅ <b>Channel Add Ho Gaya</b>\n"
+        "✅ <b>Channel Added Successfully</b>\n"
         + LINE
         + f"\n📌 Slot: <b>{slot}</b>\n"
-        f"📢 Naam: <b>{esc(chat.title)}</b>\n"
+        f"📢 Name: <b>{esc(chat.title)}</b>\n"
         f"🆔 ID: <code>{chat.id}</code>\n"
-        f"🔗 Link: {esc(link) or 'nahi'}{note}",
+        f"🔗 Link: {esc(link) or 'Not available'}{note}",
         quote=True,
         disable_web_page_preview=True,
     )
@@ -721,23 +721,23 @@ async def addchannel_cmd(client: Client, m: Message):
 @app.on_message(filters.command("delchannel") & filters.private & filters.user(ADMINS))
 async def delchannel_cmd(_, m: Message):
     if len(m.command) < 2 or not m.command[1].isdigit():
-        return await m.reply("Use karo: <code>/delchannel 1</code>", quote=True)
+        return await m.reply("Usage: <code>/delchannel 1</code>", quote=True)
     slot = int(m.command[1])
     await store.del_channel(slot)
     if any(c["n"] == slot for c in ENV_CHANNELS):
-        await store.set_channel(slot, "", "")  # env wale slot ko band karo
-    await m.reply(f"🗑 Slot <b>{slot}</b> hata diya.", quote=True)
+        await store.set_channel(slot, "", "")  # Disable the environment-configured slot
+    await m.reply(f"🗑 Slot <b>{slot}</b> has been removed.", quote=True)
 
 
 @app.on_message(filters.command("channels") & filters.private & filters.user(ADMINS))
 async def channels_cmd(client: Client, m: Message):
     chans = await get_force_channels()
     if not chans:
-        return await m.reply("📭 Koi force-join channel set nahi hai. /addchannel use karo.", quote=True)
+        return await m.reply("📭 No force-join channels are configured. Use /addchannel.", quote=True)
 
     blocks = []
     for c in chans:
-        title, bot_ok = "❓ Nahi mila", False
+        title, bot_ok = "❓ Not Found", False
         try:
             chat = await client.get_chat(c["ref"])
             title = chat.title
@@ -748,8 +748,8 @@ async def channels_cmd(client: Client, m: Message):
         blocks.append(
             f"<b>{c['n']}. {esc(title)}</b>\n"
             f"🆔 <code>{c['ref']}</code>\n"
-            f"🔗 {esc(c['link']) or 'link nahi'}\n"
-            f"🛡 Bot: {'✅ Admin' if bot_ok else '⚠️ Admin nahi'}"
+            f"🔗 {esc(c['link']) or 'Link not available'}\n"
+            f"🛡 Bot: {'✅ Admin' if bot_ok else '⚠️ Not an admin'}"
         )
     await m.reply(
         "📢 <b>Force-Join Channels</b>\n" + LINE + "\n" + "\n\n".join(blocks),
@@ -771,7 +771,7 @@ def cache_query(token: str, query: str):
 
 
 async def run_search(query: str):
-    """(results, fuzzy). Exact na mile to milte-julte results (kam se kam ek word)."""
+    """Returns (results, fuzzy). If no exact match is found, returns similar results."""
     words = norm(query).split()
     results = await store.find(words)
     if results or len(words) < 2:
@@ -794,11 +794,11 @@ async def build_page(query: str, page: int, token: str):
         "🔎 <b>Search Results</b>\n"
         + LINE
         + f"\n📝 Query: <i>{esc(query[:60])}</i>\n"
-        f"📦 Mile: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
+        f"📦 Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
     )
     if fuzzy:
-        text += "🔀 <i>Exact match nahi mila, milte-julte results dikha raha hu</i>\n"
-    text += LINE + "\n👇 <b>Apni file chuno</b>"
+        text += "🔀 <i>No exact match found. Showing similar results.</i>\n"
+    text += LINE + "\n👇 <b>Select Your File</b>"
 
     rows = [
         [
@@ -815,20 +815,20 @@ async def build_page(query: str, page: int, token: str):
             nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pg|{page - 1}|{token}"))
         nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="noop"))
         if page < pages - 1:
-            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pg|{page + 1}|{token}"))
+            nav.append(InlineKeyboardButton("Next »", callback_data=f"pg|{page + 1}|{token}"))
         rows.append(nav)
-    rows.append([InlineKeyboardButton("❌ Close", callback_data="close")])
+    rows.append([InlineKeyboardButton("× Close ×", callback_data="close")])
     return text, InlineKeyboardMarkup(rows)
 
 
 NOT_FOUND_TEXT = (
-    "😕 <b>Kuch Nahi Mila</b>\n"
+    "😕 <b>No Results Found</b>\n"
     + LINE
     + "\n🔎 <i>{query}</i>\n\n"
-    "💡 <b>Try karo:</b>\n"
-    "• Spelling check karo\n"
-    "• Chhota naam likho (sirf main word)\n"
-    "• Hindi/English dono me try karo\n"
+    "💡 <b>Try These:</b>\n"
+    "• Check the spelling\n"
+    "• Use a shorter name (only the main keyword)\n"
+    "• Try both Hindi and English names\n"
     + LINE
 )
 
@@ -881,11 +881,11 @@ async def search_handler(client: Client, m: Message):
 async def recheck_cb(client: Client, cq: CallbackQuery):
     missing = await not_joined(client, cq.from_user.id)
     if missing:
-        await cq.answer("Abhi bhi saare channels join nahi kiye!", show_alert=True)
+        await cq.answer("You have not joined all the required channels yet!", show_alert=True)
         text, kb = await join_view(missing)
         await edit(cq.message, text, kb)
         return
-    await cq.answer("🎉 Shukriya! Ab Movie/series ka naam bhejo.")
+    await cq.answer("🎉 Thank you! Now send a Movie/Series name.")
     await edit(cq.message, welcome_text(cq.from_user), home_keyboard())
 
 
@@ -917,7 +917,7 @@ async def close_cb(_, cq: CallbackQuery):
     try:
         await cq.message.delete()
     except Exception:
-        await cq.answer("Close nahi ho paya.", show_alert=True)
+        await cq.answer("Unable to close this message.", show_alert=True)
         return
     await cq.answer()
 
@@ -927,7 +927,7 @@ async def page_cb(client: Client, cq: CallbackQuery):
     _, page, token = cq.data.split("|", 2)
     query = _search_cache.get(token)
     if not query:
-        return await cq.answer("Ye search purani ho gayi, dobara naam bhejo.", show_alert=True)
+        return await cq.answer("This search has expired. Please send the name again.", show_alert=True)
     text, kb = await build_page(query, int(page), token)
     if text:
         await edit(cq.message, text, kb)
@@ -942,7 +942,7 @@ def file_caption(title: str, size: int) -> str:
     )
     if AUTO_DELETE_SECONDS > 0:
         text += f"⏳ Auto-delete: <b>{minutes()} min</b>\n"
-    text += LINE + "\n✅ <i>Abhi save ya forward kar lo</i>"
+    text += LINE + "\n✅ <i>Save or forward this file now.</i>"
     if BOT_USERNAME:
         text += f"\n🤖 @{BOT_USERNAME}"
     return text[:1024]
@@ -952,7 +952,7 @@ def file_caption(title: str, size: int) -> str:
 async def get_cb(client: Client, cq: CallbackQuery):
     missing = await not_joined(client, cq.from_user.id)
     if missing:
-        await cq.answer("Pehle saare channels join karo!", show_alert=True)
+        await cq.answer("Please join all required channels first!", show_alert=True)
         text, kb = await join_view(missing)
         return await client.send_message(cq.from_user.id, text, reply_markup=kb)
 
@@ -963,31 +963,31 @@ async def get_cb(client: Client, cq: CallbackQuery):
     kb = file_keyboard()
     sent = None
 
-    # 1) Database me saved file_id se bhejo (restart ke baad bhi chalta hai)
+    # 1) Send using the saved file_id (works even after restarts)
     if row and row.get("file_id"):
         try:
             sent = await client.send_cached_media(
                 cq.from_user.id, row["file_id"], caption=caption, reply_markup=kb
             )
         except Exception as e:
-            log.warning("file_id se nahi bheja ja saka (%s), channel se copy try kar raha hu", e)
+            log.warning("Unable to send using file_id (%s). Trying to copy from the channel.", e)
 
-    # 2) Fallback: DB channel se copy
+    # 2) Fallback: Copy the file from the DB channel
     if not sent:
         try:
             sent = await client.copy_message(
                 cq.from_user.id, DB_CHANNEL, msg_id, caption=caption, reply_markup=kb
             )
         except Exception as e:
-            log.error("File bhejne me error: %s", e)
-            return await cq.answer("File nahi mil payi, baad me try karo.", show_alert=True)
+            log.error("Unable to send file: %s", e)
+            return await cq.answer("Unable to retrieve the file. Please try again later.", show_alert=True)
 
-    await cq.answer("📥 File bhej di ✅")
+    await cq.answer("📥 File sent successfully ✅")
     schedule_delete(sent)
 
 
 # ----------------------------------------------------------------------------
-# START
+# STARTUP
 # ----------------------------------------------------------------------------
 async def notify_admins(text: str):
     for admin in ADMINS[:5]:
@@ -1002,36 +1002,36 @@ async def _startup_scan():
         found, last_id = await scan_db_channel(full=False)
         total = await store.count_files()
         text = (
-            "✅ <b>Bot Start Ho Gaya</b>\n"
+            "✅ <b>Bot Started Successfully</b>\n"
             + LINE
-            + f"\n📥 Nayi files index hui: <b>{found}</b>\n"
-            f"🎬 Total files database me: <b>{total}</b>"
+            + f"\n📥 New files indexed: <b>{found}</b>\n"
+            f"🎬 Total files in database: <b>{total}</b>"
         )
         if not store.persistent:
-            text += "\n⚠️ MONGO_URI set nahi hai, restart par data mit sakta hai."
-        log.info("Startup index: %s nayi files, total %s", found, total)
+            text += "\n⚠️ MONGO_URI is not configured. Data may be lost after restart."
+        log.info("Startup indexing: %s new files, total %s", found, total)
     except Exception as e:
         text = (
-            f"❌ <b>Startup index fail</b>\n{esc(e)}\n\n"
-            "Bot ko DB channel me admin banao, phir /index full chalao."
+            f"❌ <b>Startup Indexing Failed</b>\n{esc(e)}\n\n"
+            "Make the bot an admin in the DB channel, then run /index full."
         )
-        log.error("Startup index fail: %s", e)
+        log.error("Startup indexing failed: %s", e)
     await notify_admins(text)
 
 
 async def set_menu_commands():
-    """Telegram ke command menu (/ dabane par) me commands dikhte hain."""
+    """Displays commands in Telegram's command menu when users type /."""
     user_cmds = [
-        BotCommand("start", "🏠 Bot start karo"),
-        BotCommand("help", "📖 Kaise use kare"),
+        BotCommand("start", "🏠 Start the bot"),
+        BotCommand("help", "👾 How to use the bot"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("stats", "📊 Bot statistics"),
-        BotCommand("broadcast", "📢 Sabko message bhejo"),
-        BotCommand("index", "🗂 DB channel index karo"),
-        BotCommand("addchannel", "➕ Force-join channel jodo"),
-        BotCommand("delchannel", "🗑 Channel hatao"),
-        BotCommand("channels", "📋 Channels ki list"),
+        BotCommand("broadcast", "📢 Send a message to all users"),
+        BotCommand("index", "🗂 Index the DB channel"),
+        BotCommand("addchannel", "➕ Add a force-join channel"),
+        BotCommand("delchannel", "🗑 Remove a channel"),
+        BotCommand("channels", "📋 View the channel list"),
     ]
     try:
         await app.set_bot_commands(user_cmds)
@@ -1039,9 +1039,9 @@ async def set_menu_commands():
             try:
                 await app.set_bot_commands(admin_cmds, scope=BotCommandScopeChat(admin))
             except Exception:
-                pass  # admin ne bot start nahi kiya ho to ye fail ho sakta hai
+                pass  # This may fail if the admin has not started the bot
     except Exception as e:
-        log.warning("Command menu set nahi hua: %s", e)
+        log.warning("Unable to set command menu: %s", e)
 
 
 async def main():
@@ -1049,7 +1049,7 @@ async def main():
     await store.init()
     await app.start()
     BOT_USERNAME = (await app.get_me()).username or ""
-    log.info("Bot start ho gaya: @%s", BOT_USERNAME)
+    log.info("Bot started: @%s", BOT_USERNAME)
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
@@ -1061,4 +1061,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    app.run(main())
+    app.run(main)
