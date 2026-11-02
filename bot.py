@@ -252,7 +252,7 @@ def welcome_text(user) -> str:
             "┣ 📥 <b>Instant Delivery</b>\n"
             "┗ ⏳ <b>Auto-delete</b>: {minutes} min\n"
             + LINE
-            + "\n💡 <i>Tip: chhota naam likho, jaise</i> <code>physics ncert</code>"
+            + "\n💡 <i>Tip: chhota naam likho, jaise</i> <code>Coolie </code>"
         )
     return body.format(
         mention=user.mention,
