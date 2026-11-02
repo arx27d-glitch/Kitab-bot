@@ -5,7 +5,7 @@ import re
 import sqlite3
 
 from dotenv import load_dotenv
-from pyrogram import Client, enums, filters
+from pyrogram import Client, enums, filters, idle
 from pyrogram.errors import FloodWait, RPCError, UserNotParticipant
 from pyrogram.types import (
     CallbackQuery,
@@ -35,6 +35,9 @@ ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-
 # Auto-forward: in groups ke naye messages/files apne aap DB_CHANNEL me copy honge
 SOURCE_GROUPS = [int(x) for x in env("SOURCE_GROUPS").replace(",", " ").split() if x.lstrip("-").isdigit()]
 FORWARD_ALL = env("FORWARD_ALL", "false").lower() in ("1", "true", "yes")  # true = text bhi forward
+
+# Bot start hote hi DB channel ki purani files bhi index ho jayengi
+AUTO_INDEX_ON_START = env("AUTO_INDEX_ON_START", "true").lower() in ("1", "true", "yes")
 
 BOT_NAME = env("BOT_NAME", "Kitab Bot")
 OWNER_USERNAME = env("OWNER_USERNAME").lstrip("@")
@@ -88,7 +91,7 @@ def load_force_channels():
     return channels
 
 
-FORCE_CHANNELS = load_force_channels()
+ENV_CHANNELS = load_force_channels()
 
 if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
     raise SystemExit("API_ID, API_HASH, BOT_TOKEN aur DB_CHANNEL set karna zaroori hai (.env dekho).")
@@ -106,7 +109,19 @@ db.execute(
 )
 db.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY)")
 db.execute("CREATE TABLE IF NOT EXISTS forwarded(uid TEXT PRIMARY KEY)")
+db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS channels(slot INTEGER PRIMARY KEY, ref TEXT, link TEXT)")
 db.commit()
+
+
+def get_meta(key: str, default: str = "") -> str:
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(key: str, value: str):
+    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, value))
+    db.commit()
 
 
 def norm(text: str) -> str:
@@ -161,9 +176,20 @@ def schedule_delete(*messages: Message, delay: int = AUTO_DELETE_SECONDS):
 # ----------------------------------------------------------------------------
 # FORCE JOIN
 # ----------------------------------------------------------------------------
+def get_force_channels():
+    """Env wale channels + /addchannel se jode gaye channels (slot number se merge)."""
+    merged = {c["n"]: c for c in ENV_CHANNELS}
+    for slot, ref, link in db.execute("SELECT slot, ref, link FROM channels").fetchall():
+        if not ref:  # /delchannel se hataya gaya slot
+            merged.pop(slot, None)
+            continue
+        merged[slot] = {"n": slot, "ref": parse_chat(ref), "link": link}
+    return [merged[k] for k in sorted(merged)]
+
+
 async def not_joined(client: Client, user_id: int):
     missing = []
-    for ch in FORCE_CHANNELS:
+    for ch in get_force_channels():
         try:
             member = await client.get_chat_member(ch["ref"], user_id)
             if member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
@@ -309,6 +335,163 @@ async def broadcast_cmd(client: Client, m: Message):
 
 
 # ----------------------------------------------------------------------------
+# PURANI FILES INDEX KARNA (bot start se pehle jo files DB channel me thi)
+# Bots channel ki history seedha nahi padh sakte, isliye message id 1 se last id
+# tak batch me get_messages se scan kiya jata hai.
+# ----------------------------------------------------------------------------
+_scan_lock = asyncio.Lock()
+
+
+async def scan_db_channel(full: bool = False):
+    """(found, last_id) return karta hai. full=True = shuru se poora scan."""
+    async with _scan_lock:
+        try:
+            tmp = await app.send_message(DB_CHANNEL, "🔄 indexing...", disable_notification=True)
+        except Exception as e:
+            log.error("DB channel me message nahi bhej paya (bot admin hai?): %s", e)
+            raise
+        last_id = tmp.id
+        try:
+            await tmp.delete()
+        except Exception:
+            pass
+
+        start = 1 if full else int(get_meta("last_scanned", "0")) + 1
+        found = 0
+        for first in range(start, last_id + 1, 200):
+            ids = list(range(first, min(first + 200, last_id + 1)))
+            try:
+                msgs = await app.get_messages(DB_CHANNEL, ids)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                msgs = await app.get_messages(DB_CHANNEL, ids)
+            for msg in msgs:
+                if msg and not msg.empty and (msg.document or msg.video or msg.audio):
+                    index_message(msg)
+                    found += 1
+            await asyncio.sleep(0.5)
+
+        set_meta("last_scanned", str(last_id))
+        log.info("Scan khatam: %s files index hui (last id %s)", found, last_id)
+        return found, last_id
+
+
+@app.on_message(filters.command("index") & filters.private & filters.user(ADMINS))
+async def index_cmd(_, m: Message):
+    full = len(m.command) > 1 and m.command[1].lower() == "full"
+    status = await m.reply("⏳ DB channel scan ho raha hai, thoda wait karo...")
+    try:
+        found, last_id = await scan_db_channel(full=full)
+    except Exception as e:
+        return await status.edit_text(
+            f"❌ Scan fail: {e}\nBot DB channel me admin hai aur post kar sakta hai? Check karo."
+        )
+    total = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    await status.edit_text(
+        f"✅ Scan complete\nIs baar mili: <b>{found}</b> files\nTotal indexed: <b>{total}</b>\nLast message id: {last_id}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+# ----------------------------------------------------------------------------
+# ADMIN: FORCE-JOIN CHANNEL ADD / REMOVE
+# ----------------------------------------------------------------------------
+ADDCHANNEL_USAGE = (
+    "Use karo:\n"
+    "<code>/addchannel 1 @username</code>\n"
+    "<code>/addchannel 2 -1001234567890</code>\n"
+    "<code>/addchannel 3 -1001234567890 https://t.me/+InviteLink</code>\n"
+    "<code>/addchannel @username</code> (khali slot me apne aap lagega)\n\n"
+    "Slot 1 se 10 tak. Same slot par dobara dalne se purana channel replace ho jata hai.\n"
+    "Bot us channel me admin hona chahiye."
+)
+
+
+@app.on_message(filters.command("addchannel") & filters.private & filters.user(ADMINS))
+async def addchannel_cmd(client: Client, m: Message):
+    args = m.command[1:]
+    if not args:
+        return await m.reply(ADDCHANNEL_USAGE, parse_mode=enums.ParseMode.HTML)
+
+    if re.fullmatch(r"\d{1,2}", args[0]) and len(args) >= 2:
+        slot, rest = int(args[0]), args[1:]
+    else:
+        used = {c["n"] for c in get_force_channels()}
+        slot = next((i for i in range(1, 11) if i not in used), None)
+        if slot is None:
+            return await m.reply("Saare 10 slot bhar chuke hain. Slot number dekar replace karo ya /delchannel use karo.")
+        rest = args
+    if not 1 <= slot <= 10:
+        return await m.reply("Slot 1 se 10 ke beech hona chahiye.")
+
+    ref = parse_chat(rest[0])
+    link = rest[1] if len(rest) > 1 else ""
+
+    try:
+        chat = await client.get_chat(ref)
+    except Exception as e:
+        return await m.reply(
+            f"❌ Channel nahi mila: {e}\n\nPehle bot ko us channel me <b>admin</b> banao, phir command dobara chalao.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    is_admin = False
+    try:
+        me = await client.get_chat_member(chat.id, "me")
+        is_admin = me.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+    except Exception:
+        pass
+
+    if not link:
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        else:
+            try:
+                link = await client.export_chat_invite_link(chat.id)
+            except Exception:
+                link = ""
+
+    db.execute("INSERT OR REPLACE INTO channels VALUES(?,?,?)", (slot, str(chat.id), link))
+    db.commit()
+
+    note = ""
+    if not is_admin:
+        note += "\n⚠️ Bot is channel me admin nahi dikh raha, join check tabhi chalega jab admin banega."
+    if not link:
+        note += "\n⚠️ Private channel hai aur link nahi mila. Command ke end me invite link bhi do."
+    await m.reply(
+        f"✅ Slot <b>{slot}</b> me add ho gaya: <b>{chat.title}</b>\nID: <code>{chat.id}</code>\nLink: {link or 'nahi'}{note}",
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_message(filters.command("delchannel") & filters.private & filters.user(ADMINS))
+async def delchannel_cmd(_, m: Message):
+    if len(m.command) < 2 or not m.command[1].isdigit():
+        return await m.reply("Use karo: <code>/delchannel 1</code>", parse_mode=enums.ParseMode.HTML)
+    slot = int(m.command[1])
+    db.execute("DELETE FROM channels WHERE slot=?", (slot,))
+    if any(c["n"] == slot for c in ENV_CHANNELS):
+        db.execute("INSERT INTO channels VALUES(?,?,?)", (slot, "", ""))  # env wale slot ko band karo
+    db.commit()
+    await m.reply(f"🗑 Slot {slot} hata diya.")
+
+
+@app.on_message(filters.command("channels") & filters.private & filters.user(ADMINS))
+async def channels_cmd(_, m: Message):
+    chans = get_force_channels()
+    if not chans:
+        return await m.reply("Koi force-join channel set nahi hai. /addchannel use karo.")
+    lines = [f"{c['n']}. <code>{c['ref']}</code> - {c['link'] or 'link nahi'}" for c in chans]
+    await m.reply(
+        "📢 Force-join channels:\n" + "\n".join(lines),
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# ----------------------------------------------------------------------------
 # SEARCH
 # ----------------------------------------------------------------------------
 _search_cache: dict = {}
@@ -341,7 +524,11 @@ def build_page(query: str, page: int, token: str):
 
 
 @app.on_message(
-    filters.text & filters.private & ~filters.command(["start", "help", "stats", "broadcast"])
+    filters.text
+    & filters.private
+    & ~filters.command(
+        ["start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index"]
+    )
 )
 async def search_handler(client: Client, m: Message):
     add_user(m.from_user.id)
@@ -417,7 +604,23 @@ async def get_cb(client: Client, cq: CallbackQuery):
         schedule_delete(sent, notice)
 
 
-if __name__ == "__main__":
-    log.info("Bot start ho raha hai... Force-join channels: %s", [c["ref"] for c in FORCE_CHANNELS])
+async def _startup_scan():
+    try:
+        found, last_id = await scan_db_channel(full=False)
+        log.info("Startup index: %s nayi files mili (last id %s)", found, last_id)
+    except Exception as e:
+        log.error("Startup index fail: %s", e)
+
+
+async def main():
+    await app.start()
+    log.info("Bot start ho gaya. Force-join channels: %s", [c["ref"] for c in get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
-    app.run()
+    if AUTO_INDEX_ON_START:
+        asyncio.create_task(_startup_scan())
+    await idle()
+    await app.stop()
+
+
+if __name__ == "__main__":
+    app.run(main())
