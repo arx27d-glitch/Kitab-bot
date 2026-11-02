@@ -32,6 +32,10 @@ BOT_TOKEN = env("BOT_TOKEN")
 DB_CHANNEL = int(env("DB_CHANNEL", "0"))
 ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-").isdigit()]
 
+# Auto-forward: in groups ke naye messages/files apne aap DB_CHANNEL me copy honge
+SOURCE_GROUPS = [int(x) for x in env("SOURCE_GROUPS").replace(",", " ").split() if x.lstrip("-").isdigit()]
+FORWARD_ALL = env("FORWARD_ALL", "false").lower() in ("1", "true", "yes")  # true = text bhi forward
+
 BOT_NAME = env("BOT_NAME", "Kitab Bot")
 OWNER_USERNAME = env("OWNER_USERNAME").lstrip("@")
 SUPPORT_USERNAME = env("SUPPORT_USERNAME").lstrip("@")
@@ -101,6 +105,7 @@ db.execute(
         msg_id INTEGER PRIMARY KEY, title TEXT, search TEXT, size INTEGER)"""
 )
 db.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY)")
+db.execute("CREATE TABLE IF NOT EXISTS forwarded(uid TEXT PRIMARY KEY)")
 db.commit()
 
 
@@ -206,9 +211,10 @@ def welcome_text(user) -> str:
 # ----------------------------------------------------------------------------
 # INDEXING (DB channel me jo file aayegi wo search me aa jayegi)
 # ----------------------------------------------------------------------------
-@app.on_message(filters.chat(DB_CHANNEL) & (filters.document | filters.video | filters.audio))
-async def index_file(_, m: Message):
+def index_message(m: Message):
     media = m.document or m.video or m.audio
+    if not media:
+        return
     title = getattr(media, "file_name", None) or m.caption or f"file_{m.id}"
     db.execute(
         "INSERT OR REPLACE INTO files VALUES(?,?,?,?)",
@@ -216,6 +222,42 @@ async def index_file(_, m: Message):
     )
     db.commit()
     log.info("Indexed: %s", title)
+
+
+# DB channel me kisi ne khud file post ki to bhi index hogi
+@app.on_message(filters.chat(DB_CHANNEL) & (filters.document | filters.video | filters.audio))
+async def index_file(_, m: Message):
+    index_message(m)
+
+
+# ----------------------------------------------------------------------------
+# AUTO FORWARD: SOURCE_GROUPS ke naye messages -> DB_CHANNEL (aur turant index)
+# ----------------------------------------------------------------------------
+if SOURCE_GROUPS:
+
+    @app.on_message(filters.chat(SOURCE_GROUPS) & ~filters.service)
+    async def auto_forward(_, m: Message):
+        media = m.document or m.video or m.audio
+        if not media and not FORWARD_ALL:
+            return
+
+        uid = media.file_unique_id if media else None
+        if uid and db.execute("SELECT 1 FROM forwarded WHERE uid=?", (uid,)).fetchone():
+            return  # ye file pehle hi forward ho chuki hai
+
+        try:
+            sent = await m.copy(DB_CHANNEL)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            sent = await m.copy(DB_CHANNEL)
+        except Exception as e:
+            log.error("Auto-forward fail (group %s): %s", m.chat.id, e)
+            return
+
+        if uid:
+            db.execute("INSERT OR IGNORE INTO forwarded VALUES(?)", (uid,))
+            db.commit()
+            index_message(sent)
 
 
 # ----------------------------------------------------------------------------
@@ -377,4 +419,5 @@ async def get_cb(client: Client, cq: CallbackQuery):
 
 if __name__ == "__main__":
     log.info("Bot start ho raha hai... Force-join channels: %s", [c["ref"] for c in FORCE_CHANNELS])
+    log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     app.run()
