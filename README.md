@@ -1,4 +1,4 @@
-# 📚 MOVIE Bot (Telegram)
+# 🎬 MOVIE Bot (Telegram)
 
 Ek Telegram bot jo Movie/Series ka **naam** bhejne par file dhoond kar bhej deta hai.
 
