@@ -56,8 +56,9 @@ START_TEXT = env(
 JOIN_TEXT = env(
     "JOIN_TEXT",
     "⚠️ Bot use karne ke liye neeche diye gaye <b>saare channels</b> join karo.\n\n"
-    "Public aur Private dono channels ho sakte hain. Sabhi channels join karna zaroori hai.\n\n"
-    "Join karne ke baad <b>✅ Maine Join Kar Liya</b> button dabao.",
+    "Public aur Private dono channels ho sakte hain. Sabhi configured channels join karna zaroori hai.\n"
+    "Private channel mein join request bheji hai to admin ke approve karne ka wait karo.\n\n"
+    "Sab join/approve hone ke baad <b>✅ Maine Join Kar Liya</b> button dabao.",
 ).replace("\\n", "\n")
 
 
@@ -182,37 +183,47 @@ def schedule_delete(*messages: Message, delay: int = AUTO_DELETE_SECONDS):
 # FORCE JOIN
 # ----------------------------------------------------------------------------
 def get_force_channels():
-    """Environment channels + /addchannel channels; DB slot overrides env slot."""
-    merged = {c["n"]: c for c in ENV_CHANNELS}
+    """Combine Railway ENV channels and /addchannel entries.
 
-    for slot, ref, link in db.execute(
-        "SELECT slot, ref, link FROM channels"
-    ).fetchall():
-        if not ref:
-            merged.pop(slot, None)
+    Both sources are active together. Duplicate channel IDs are shown only once.
+    ENV slots and database slots are independent; /addchannel never replaces an
+    ENV channel just because the slot number is the same.
+    """
+    combined = []
+    seen = set()
+
+    for ch in ENV_CHANNELS:
+        key = str(ch["ref"]).lower()
+        if key not in seen:
+            combined.append(dict(ch))
+            seen.add(key)
+
+    rows = db.execute(
+        "SELECT slot, ref, link FROM channels WHERE ref != '' ORDER BY slot"
+    ).fetchall()
+
+    for slot, ref, link in rows:
+        parsed_ref = parse_chat(ref)
+        key = str(parsed_ref).lower()
+        if key in seen:
             continue
+        combined.append({"n": slot, "ref": parsed_ref, "link": link})
+        seen.add(key)
 
-        merged[slot] = {
-            "n": slot,
-            "ref": parse_chat(ref),
-            "link": link,
-        }
+    # Display numbering is sequential, so ENV and DB slot overlaps are clear.
+    for index, channel in enumerate(combined, start=1):
+        channel["n"] = index
 
-    return [merged[k] for k in sorted(merged)]
+    return combined
 
 
 async def not_joined(client: Client, user_id: int):
-    """Return all channels the user has not joined.
-
-    Verification errors are treated as not verified, so access is not
-    accidentally granted when a channel cannot be checked.
-    """
+    """Return missing channels; return None if membership could not be verified."""
     missing = []
 
     for ch in get_force_channels():
         try:
             member = await client.get_chat_member(ch["ref"], user_id)
-
             if member.status in (
                 enums.ChatMemberStatus.LEFT,
                 enums.ChatMemberStatus.BANNED,
@@ -223,16 +234,18 @@ async def not_joined(client: Client, user_id: int):
             missing.append(ch)
 
         except RPCError as e:
+            # A permissions/invalid-channel error is NOT proof that the user
+            # has not joined. Tell the user/admin to fix bot channel access.
             log.error(
-                "Channel %s verify nahi hua: %s. Bot ko channel me admin banao.",
-                ch["ref"],
-                e,
+                "Membership check failed for channel %s: %s. "
+                "Make the bot admin and verify the channel ID.",
+                ch["ref"], e,
             )
-            missing.append(ch)
+            return None
 
         except Exception as e:
-            log.exception("Channel %s check karte waqt error: %s", ch["ref"], e)
-            missing.append(ch)
+            log.exception("Channel %s check failed: %s", ch["ref"], e)
+            return None
 
     return missing
 
@@ -370,10 +383,15 @@ async def start_cmd(client: Client, m: Message):
     add_user(m.from_user.id)
 
     missing = await not_joined(client, m.from_user.id)
+    if missing is None:
+        return await m.reply(
+            "⚠️ Channel membership verify nahi ho pa raha. Admin se bot ko har force-join channel mein admin banwane aur CHANNEL ID/username check karwane ko kaho.",
+            quote=True,
+        )
     if missing:
         return await m.reply(
             JOIN_TEXT,
-            reply_markup=join_keyboard(missing),
+            reply_markup=join_keyboard(get_force_channels()),
             quote=True,
         )
 
@@ -534,8 +552,9 @@ ADDCHANNEL_USAGE = (
     "<code>/addchannel 2 -1001234567890 https://t.me/+InviteLink</code>\n"
     "<code>/addchannel @username</code>\n\n"
     "Slot 1 se 50 tak support hai.\n"
-    "Public aur Private dono channels add kar sakte ho.\n"
-    "Bot ko har channel me admin hona chahiye."
+    "Railway ke CHANNEL_1...CHANNEL_50 aur /addchannel dono ek saath kaam karte hain.\n"
+    "Duplicate channel do baar count nahi hoga.\n"
+    "Membership check ke liye bot ko har channel me admin banao."
 )
 
 
@@ -553,11 +572,8 @@ async def addchannel_cmd(client: Client, m: Message):
         slot, rest = int(args[0]), args[1:]
 
     else:
-        used = {c["n"] for c in get_force_channels()}
-        slot = next(
-            (i for i in range(1, 51) if i not in used),
-            None,
-        )
+        used = {row[0] for row in db.execute("SELECT slot FROM channels").fetchall()}
+        slot = next((i for i in range(1, 51) if i not in used), None)
 
         if slot is None:
             return await m.reply(
@@ -646,12 +662,6 @@ async def delchannel_cmd(_, m: Message):
         return await m.reply("Slot 1 se 50 ke beech hona chahiye.")
 
     db.execute("DELETE FROM channels WHERE slot=?", (slot,))
-
-    if any(c["n"] == slot for c in ENV_CHANNELS):
-        db.execute(
-            "INSERT INTO channels VALUES(?,?,?)",
-            (slot, "", ""),
-        )
 
     db.commit()
     await m.reply(f"🗑 Slot {slot} hata diya.")
@@ -760,10 +770,16 @@ async def search_handler(client: Client, m: Message):
 
     missing = await not_joined(client, m.from_user.id)
 
+    if missing is None:
+        return await m.reply(
+            "⚠️ Channel membership verify nahi ho pa raha. Admin se bot ko har force-join channel mein admin banwane aur CHANNEL ID/username check karwane ko kaho.",
+            quote=True,
+        )
+
     if missing:
         return await m.reply(
             JOIN_TEXT,
-            reply_markup=join_keyboard(missing),
+            reply_markup=join_keyboard(get_force_channels()),
             quote=True,
         )
 
@@ -796,6 +812,12 @@ async def search_handler(client: Client, m: Message):
 async def recheck_cb(client: Client, cq: CallbackQuery):
     missing = await not_joined(client, cq.from_user.id)
 
+    if missing is None:
+        return await cq.answer(
+            "Channel verify nahi ho raha. Admin ko bot permissions/ID check karni hogi.",
+            show_alert=True,
+        )
+
     if missing:
         await cq.answer(
             "Abhi bhi saare channels join nahi kiye!",
@@ -804,7 +826,7 @@ async def recheck_cb(client: Client, cq: CallbackQuery):
 
         try:
             await cq.message.edit_reply_markup(
-                join_keyboard(missing)
+                join_keyboard(get_force_channels())
             )
         except Exception:
             pass
@@ -846,6 +868,12 @@ async def page_cb(client: Client, cq: CallbackQuery):
 async def get_cb(client: Client, cq: CallbackQuery):
     missing = await not_joined(client, cq.from_user.id)
 
+    if missing is None:
+        return await cq.answer(
+            "Channel verify nahi ho raha. Admin ko bot permissions/ID check karni hogi.",
+            show_alert=True,
+        )
+
     if missing:
         await cq.answer(
             "Pehle saare channels join karo!",
@@ -855,7 +883,7 @@ async def get_cb(client: Client, cq: CallbackQuery):
         return await client.send_message(
             cq.from_user.id,
             JOIN_TEXT,
-            reply_markup=join_keyboard(missing),
+            reply_markup=join_keyboard(get_force_channels()),
         )
 
     msg_id = int(cq.data.split("|")[1])
