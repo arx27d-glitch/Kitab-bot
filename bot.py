@@ -5,6 +5,7 @@ import math
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from pyrogram import Client, enums, filters, idle
@@ -27,11 +28,12 @@ from pyrogram.types import (
     Message,
 )
 
+from quality import detect_quality, quality_counts
 from storage import MongoStore, SqliteStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("Moviebot")
+log = logging.getLogger("bookbot")
 START_TIME = time.time()
 
 
@@ -111,6 +113,11 @@ def load_force_channels():
 
 
 ENV_CHANNELS = load_force_channels()
+
+# Group where a notification is sent whenever someone starts the bot.
+# LOG_GROUP not set -> the first SOURCE_GROUPS group is used.
+_log_raw = env("LOG_GROUP")
+LOG_GROUP = parse_chat(_log_raw) if _log_raw else (SOURCE_GROUPS[0] if SOURCE_GROUPS else 0)
 
 if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
     raise SystemExit("API_ID, API_HASH, BOT_TOKEN and DB_CHANNEL are required (see .env).")
@@ -249,6 +256,39 @@ async def save_admins():
     await store.set_meta("extra_admins", " ".join(map(str, extra)))
 
 
+_known_users = set()
+
+
+async def register_user(user_id: int) -> bool:
+    """Saves the user. Returns True if this user is new."""
+    is_new = user_id not in _known_users
+    await store.add_user(user_id)
+    _known_users.add(user_id)
+    return is_new
+
+
+async def log_start(client: Client, user, is_new: bool):
+    """Sends a 'user started the bot' card to LOG_GROUP."""
+    if not LOG_GROUP:
+        return
+    ist = timezone(timedelta(hours=5, minutes=30))
+    when = datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
+    text = (
+        ("♡ <b>New User Started The Bot</b>\n" if is_new else "♧ <b>User Started The Bot</b>\n")
+        + LINE
+        + f"\n♧ Name: {user.mention}\n"
+        f"¤ ID: <code>{user.id}</code>\n"
+        f"◇ Username: {('@' + esc(user.username)) if user.username else 'none'}\n"
+        f"□ Time: {when}\n"
+        f"☆ Total users: <b>{await store.count_users()}</b>\n"
+        + LINE
+    )
+    try:
+        await client.send_message(LOG_GROUP, text, link_preview_options=NO_PREVIEW)
+    except Exception as e:
+        log.warning("Could not send start log to LOG_GROUP (%s). Is the bot added in that group?", e)
+
+
 _tasks = set()
 
 
@@ -318,6 +358,7 @@ def help_text(is_admin: bool) -> str:
         + LINE
         + "\n♤ <b>Tips</b>\n"
         "• Use a short and simple name\n"
+        "• Tap a quality button (1080p / 720p / 480p) to filter the files\n"
         "• Double-check the spelling\n"
         "• Movie/Series name only, like <code>KGF </code>"
     )
@@ -560,7 +601,8 @@ async def scan_db_channel(full: bool = False, progress=None):
 # ----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, m: Message):
-    await store.add_user(m.from_user.id)
+    is_new = await register_user(m.from_user.id)
+    await log_start(client, m.from_user, is_new)
     missing = await not_joined(client, m.from_user.id)
     if missing:
         text, kb = await join_view(missing)
@@ -726,6 +768,7 @@ async def broadcast_cmd(client: Client, m: Message):
         except (UserIsBlocked, InputUserDeactivated, PeerIdInvalid):
             blocked += 1
             await store.delete_user(uid)  # remove users who blocked the bot from the list
+            _known_users.discard(uid)
         except Exception:
             fail += 1
 
@@ -906,10 +949,15 @@ async def channels_cmd(client: Client, m: Message):
 _search_cache: dict = {}
 
 
+_quality_cache: dict = {}  # token -> selected quality (e.g. "1080p")
+
+
 def cache_query(token: str, query: str):
     _search_cache[token] = query
     while len(_search_cache) > 500:
-        _search_cache.pop(next(iter(_search_cache)))
+        old = next(iter(_search_cache))
+        _search_cache.pop(old)
+        _quality_cache.pop(old, None)
 
 
 async def run_search(query: str):
@@ -923,9 +971,19 @@ async def run_search(query: str):
 
 
 async def build_page(query: str, page: int, token: str):
-    results, fuzzy = await run_search(query)
-    if not results:
+    all_results, fuzzy = await run_search(query)
+    if not all_results:
         return None, None
+
+    # quality buttons are built from the file names (1080p / 720p / 480p ...)
+    counts = quality_counts(title for _, title, _ in all_results)
+    selected = _quality_cache.get(token)
+    results = all_results
+    if selected:
+        results = [r for r in all_results if detect_quality(r[1]) == selected]
+        if not results:  # that quality is not in this search anymore
+            _quality_cache.pop(token, None)
+            selected, results = None, all_results
 
     total = len(results)
     pages = max(math.ceil(total / RESULTS_PER_PAGE), 1)
@@ -938,11 +996,28 @@ async def build_page(query: str, page: int, token: str):
         + f"\n□ Query: <i>{esc(query[:60])}</i>\n"
         f"□ Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
     )
+    if selected:
+        text += f"◇ Quality: <b>{selected}</b>\n"
     if fuzzy:
         text += "¤ <i>No exact match found, showing similar results</i>\n"
-    text += LINE + "\n▼ <b>Choose your file</b>"
+    text += LINE + "\n▼ <b>Choose quality / file</b>"
 
-    rows = [
+    rows = []
+    if len(counts) >= 2 or selected:
+        qbtns = [
+            btn(
+                f"{'✓ ' if q == selected else ''}{q} ({c})",
+                GREEN if q == selected else None,
+                callback_data=f"q|{q}|{token}",
+            )
+            for q, c in counts.items()
+        ]
+        for i in range(0, len(qbtns), 3):
+            rows.append(qbtns[i:i + 3])
+        if selected:
+            rows.append([InlineKeyboardButton("◇ All Qualities", callback_data=f"q|all|{token}")])
+
+    rows += [
         [
             InlineKeyboardButton(
                 f"{file_icon(title)} {human(size)} ┃ {title[:38]}",
@@ -986,7 +1061,7 @@ NOT_FOUND_TEXT = (
     )
 )
 async def search_handler(client: Client, m: Message):
-    await store.add_user(m.from_user.id)
+    await register_user(m.from_user.id)
     missing = await not_joined(client, m.from_user.id)
     if missing:
         text, kb = await join_view(missing)
@@ -1064,6 +1139,22 @@ async def close_cb(_, cq: CallbackQuery):
     except Exception:
         await cq.answer("Couldn't close this.", show_alert=True)
         return
+    await cq.answer()
+
+
+@app.on_callback_query(filters.regex(r"^q\|"))
+async def quality_cb(client: Client, cq: CallbackQuery):
+    _, quality, token = cq.data.split("|", 2)
+    query = _search_cache.get(token)
+    if not query:
+        return await cq.answer("This search has expired, please send the name again.", show_alert=True)
+    if quality == "all" or _quality_cache.get(token) == quality:
+        _quality_cache.pop(token, None)  # pressing the selected quality again clears it
+    else:
+        _quality_cache[token] = quality
+    text, kb = await build_page(query, 0, token)
+    if text:
+        await edit(cq.message, text, kb)
     await cq.answer()
 
 
@@ -1201,6 +1292,7 @@ async def main():
     global BOT_USERNAME
     await store.init()
     await load_admins()
+    _known_users.update(await store.all_user_ids())
     await app.start()
     BOT_USERNAME = (await app.get_me()).username or ""
     log.info("Bot started: @%s", BOT_USERNAME)
