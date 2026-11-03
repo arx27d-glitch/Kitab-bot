@@ -23,6 +23,7 @@ from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
 )
 
@@ -30,7 +31,7 @@ from storage import MongoStore, SqliteStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("bookbot")
+log = logging.getLogger("Moviebot")
 START_TIME = time.time()
 
 
@@ -50,6 +51,8 @@ API_HASH = env("API_HASH")
 BOT_TOKEN = env("BOT_TOKEN")
 DB_CHANNEL = int(env("DB_CHANNEL", "0"))
 ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-").isdigit()]
+# env wale ADMINS = owners. /addadmin se jude admin bhi yahan aa jate hain.
+ALL_ADMINS = set(ADMINS)
 
 # Database: provide MONGO_URI so data survives restarts (recommended)
 MONGO_URI = env("MONGO_URI")
@@ -65,11 +68,11 @@ AUTO_INDEX_ON_START = env_bool("AUTO_INDEX_ON_START", "true")
 # If the bot can't post in the DB channel, give the last message id here for scanning
 DB_LAST_MESSAGE_ID = int(env("DB_LAST_MESSAGE_ID", "0") or 0)
 
-BOT_NAME = env("BOT_NAME", "MOVIE HUB 🎬 Bot")
+BOT_NAME = env("BOT_NAME", "MOVIE HUB ☆ Bot")
 OWNER_USERNAME = env("OWNER_USERNAME").lstrip("@")
 SUPPORT_USERNAME = env("SUPPORT_USERNAME").lstrip("@")
 UPDATES_CHANNEL = env("UPDATES_CHANNEL").lstrip("@")
-START_PIC = env("START_PIC")  # optional: welcome photo (link or file_id)
+START_PIC = env("START_PIC")  # optional default welcome photo (admin can override with /setstart)
 
 AUTO_DELETE_SECONDS = int(env("AUTO_DELETE_SECONDS", "300"))  # 300 = 5 minutes, 0 = off
 RESULTS_PER_PAGE = int(env("RESULTS_PER_PAGE", "8"))
@@ -136,6 +139,25 @@ else:
 # ----------------------------------------------------------------------------
 LINE = "━━━━━━━━━━━━━━━━━━"
 
+# Link preview off (new-style option, replaces disable_web_page_preview)
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+# Colored buttons (Bot API 9.4+). Needs PyroTGFork (see requirements.txt)
+_BS = getattr(enums, "ButtonStyle", None)
+BLUE = _BS.PRIMARY if _BS else None
+GREEN = _BS.SUCCESS if _BS else None
+RED = _BS.DANGER if _BS else None
+
+
+def btn(text: str, style=None, **kw) -> InlineKeyboardButton:
+    """InlineKeyboardButton with optional color. Falls back to a normal button if unsupported."""
+    if style is not None:
+        try:
+            return InlineKeyboardButton(text, style=style, **kw)
+        except TypeError:
+            log.warning("This pyrogram version has no button colors, using normal button.")
+    return InlineKeyboardButton(text, **kw)
+
 
 def esc(text) -> str:
     return html.escape(str(text or ""), quote=False)
@@ -157,22 +179,22 @@ def human(size) -> str:
 def file_icon(title: str) -> str:
     t = (title or "").lower()
     if t.endswith(".pdf"):
-        return "📕"
+        return "♡"
     if t.endswith((".epub", ".mobi", ".azw3")):
-        return "📗"
+        return "♧"
     if t.endswith((".doc", ".docx", ".odt")):
-        return "📘"
+        return "◇"
     if t.endswith((".ppt", ".pptx")):
-        return "📙"
+        return "♤"
     if t.endswith((".txt", ".rtf")):
-        return "📄"
+        return "□"
     if t.endswith((".zip", ".rar", ".7z")):
-        return "🗜"
+        return "¤"
     if t.endswith((".mp4", ".mkv", ".avi", ".mov", ".webm")):
-        return "🎞"
+        return "☆"
     if t.endswith((".mp3", ".m4a", ".ogg", ".wav", ".flac")):
-        return "🎧"
-    return "📚"
+        return "♪"
+    return "☆"
 
 
 def progress_bar(done: int, total: int, width: int = 8) -> str:
@@ -199,8 +221,32 @@ def minutes() -> int:
     return max(AUTO_DELETE_SECONDS // 60, 1)
 
 
+# ----------------------------------------------------------------------------
+# ADMINS (env owners + admins added with /addadmin)
+# ----------------------------------------------------------------------------
 def is_admin_id(user_id: int) -> bool:
-    return user_id in ADMINS
+    return user_id in ALL_ADMINS
+
+
+async def _admin_check(_, __, m):
+    return bool(getattr(m, "from_user", None)) and m.from_user.id in ALL_ADMINS
+
+
+# live filter: /addadmin ke turant baad naya admin commands chala sakta hai
+admin_filter = filters.create(_admin_check)
+
+# sirf env wale owners (/addadmin, /deladmin ke liye)
+owner_filter = filters.user(ADMINS)
+
+
+async def load_admins():
+    raw = await store.get_meta("extra_admins", "")
+    ALL_ADMINS.update(int(x) for x in raw.split() if x.lstrip("-").isdigit())
+
+
+async def save_admins():
+    extra = sorted(ALL_ADMINS - set(ADMINS))
+    await store.set_meta("extra_admins", " ".join(map(str, extra)))
 
 
 _tasks = set()
@@ -231,28 +277,28 @@ async def edit(msg: Message, text: str, kb=None):
         if msg.photo or msg.video or msg.animation or msg.document:
             await msg.edit_caption(text, reply_markup=kb)
         else:
-            await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            await msg.edit_text(text, reply_markup=kb, link_preview_options=NO_PREVIEW)
     except MessageNotModified:
         pass
 
 
 # ----------------------------------------------------------------------------
-# PREMIUM UI: texts + buttons
+# UI: texts + buttons
 # ----------------------------------------------------------------------------
 def welcome_text(user) -> str:
     if START_TEXT_ENV:
         body = START_TEXT_ENV
     else:
         body = (
-            "✨ <b>{bot_name}</b> ✨\n"
+            "◇ <b>{bot_name}</b> ◇\n"
             + LINE
-            + "\n👋 Hello {mention}!\n\n"
-            "🎬 Send me the <b>name</b> of any Movie or Series and I'll find the file and send it instantly.\n\n"
-            "┏ 🔍 <b>Fast Search</b>\n"
-            "┣ 📥 <b>Instant Delivery</b>\n"
-            "┗ ⏳ <b>Auto-delete</b>: {minutes} min\n"
+            + "\n♡ Hello {mention}!\n\n"
+            "☆ Send me the <b>name</b> of any Movie or Series and I'll find the file and send it instantly.\n\n"
+            "┏ ¤ <b>Fast Search</b>\n"
+            "┣ □ <b>Instant Delivery</b>\n"
+            "┗ ◇ <b>Auto-delete</b>: {minutes} min\n"
             + LINE
-            + "\n💡 <i>Tip: type a short name, like</i> <code>Coolie </code>"
+            + "\n♤ <i>Tip: type a short name, like</i> <code>Coolie </code>"
         )
     return body.format(
         mention=user.mention,
@@ -264,27 +310,30 @@ def welcome_text(user) -> str:
 
 def help_text(is_admin: bool) -> str:
     text = (
-        "🎬 <b>How To Use</b>\n"
+        "☆ <b>How To Use</b>\n"
         + LINE
-        + "\n1️⃣ Send the <b>name</b> of a movie\n"
-        "2️⃣ Pick your <b>file</b> from the result list\n"
-        f"3️⃣ Once you get the file, <b>save or forward</b> it (it gets deleted in {minutes()} min)\n"
+        + "\n1. Send the <b>name</b> of a movie\n"
+        "2. Pick your <b>file</b> from the result list\n"
+        f"3. Once you get the file, <b>save or forward</b> it (it gets deleted in {minutes()} min)\n"
         + LINE
-        + "\n💡 <b>Tips</b>\n"
+        + "\n♤ <b>Tips</b>\n"
         "• Use a short and simple name\n"
         "• Double-check the spelling\n"
         "• Movie/Series name only, like <code>KGF </code>"
     )
     if is_admin:
         text += (
-            "\n\n👑 <b>Admin Commands</b>\n"
+            "\n\n♛ <b>Admin Commands</b>\n"
             + LINE
             + "\n/stats - bot statistics\n"
             "/broadcast - message everyone (reply to a message or add text)\n"
             "/index - index new files (<code>/index full</code> = full scan)\n"
             "/addchannel - add a force-join channel\n"
             "/delchannel - remove a channel\n"
-            "/channels - list channels and their status"
+            "/channels - list channels and their status\n"
+            "/setstart - set the start image (send a photo with caption or reply to a photo)\n"
+            "/delstart - remove the start image\n"
+            "/admins - list admins"
         )
     return text
 
@@ -293,64 +342,65 @@ async def about_text() -> str:
     files = await store.count_files()
     users = await store.count_users()
     text = (
-        f"ℹ️ <b>About {esc(BOT_NAME)}</b>\n"
+        f"¤ <b>About {esc(BOT_NAME)}</b>\n"
         + LINE
-        + f"\n🎬 Files: <b>{files}</b>\n"
-        f"👥 Users: <b>{users}</b>\n"
-        f"⏳ Auto-delete: <b>{minutes()} min</b>\n"
+        + f"\n☆ Files: <b>{files}</b>\n"
+        f"♧ Users: <b>{users}</b>\n"
+        f"◇ Auto-delete: <b>{minutes()} min</b>\n"
     )
     if BOT_USERNAME:
-        text += f"🤖 Bot: @{BOT_USERNAME}\n"
+        text += f"♧ Bot: @{BOT_USERNAME}\n"
     if OWNER_USERNAME:
-        text += f"👤 Owner: @{esc(OWNER_USERNAME)}\n"
-    text += LINE + "\n💙 <i>Keep reading, keep growing.</i>"
+        text += f"♡ Owner: @{esc(OWNER_USERNAME)}\n"
+    text += LINE + "\n♡ <i>Keep watching, keep growing.</i>"
     return text
 
 
 def link_buttons():
     row = []
     if UPDATES_CHANNEL:
-        row.append(InlineKeyboardButton("📢 Updates", url=f"https://t.me/{UPDATES_CHANNEL}"))
+        row.append(InlineKeyboardButton("◇ Updates", url=f"https://t.me/{UPDATES_CHANNEL}"))
     if SUPPORT_USERNAME:
-        row.append(InlineKeyboardButton("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}"))
+        row.append(btn("♡ Support", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}"))
     return row
 
 
 def home_keyboard():
     rows = [
         [
-            InlineKeyboardButton("🎬 How To Use", callback_data="help"),
-            InlineKeyboardButton("ℹ️ About", callback_data="about"),
+            btn("☆ Help", BLUE, callback_data="help"),
+            btn("¤ About", GREEN, callback_data="about"),
         ]
     ]
     links = link_buttons()
     if links:
         rows.append(links)
     if OWNER_USERNAME:
-        rows.append([InlineKeyboardButton("👤 Owner", url=f"https://t.me/{OWNER_USERNAME}")])
+        rows.append([btn("♤ Owner", GREEN, url=f"https://t.me/{OWNER_USERNAME}")])
     return InlineKeyboardMarkup(rows)
 
 
 def back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("□ Home", callback_data="home")]])
 
 
 def file_keyboard():
     row = link_buttons()
     if OWNER_USERNAME:
-        row.append(InlineKeyboardButton("👤 Owner", url=f"https://t.me/{OWNER_USERNAME}"))
+        row.append(btn("♤ Owner", GREEN, url=f"https://t.me/{OWNER_USERNAME}"))
     return InlineKeyboardMarkup([row]) if row else None
 
 
 async def send_welcome(m: Message):
     text = welcome_text(m.from_user)
     kb = home_keyboard()
-    if START_PIC:
+    pic = await store.get_meta("start_pic", "") or START_PIC
+    if pic:
         try:
-            return await m.reply_photo(START_PIC, caption=text, reply_markup=kb, quote=True)
+            return await m.reply_photo(pic, caption=text, reply_markup=kb, quote=True)
         except Exception as e:
-            log.warning("Could not send START_PIC (%s), sending text instead", e)
-    return await m.reply(text, reply_markup=kb, quote=True, disable_web_page_preview=True)
+            log.warning("Could not send start pic (%s), sending text instead", e)
+    return await m.reply(text, reply_markup=kb, quote=True, link_preview_options=NO_PREVIEW)
 
 
 # ----------------------------------------------------------------------------
@@ -383,25 +433,25 @@ async def not_joined(client: Client, user_id: int):
 
 
 async def join_view(missing):
-    """(text, keyboard) - premium join screen with progress."""
+    """(text, keyboard) - join screen with progress."""
     total = len(await get_force_channels())
     joined = max(total - len(missing), 0)
     if JOIN_TEXT_ENV:
         text = JOIN_TEXT_ENV
     else:
         text = (
-            "🔒 <b>Access Locked</b>\n"
+            "□ <b>Access Locked</b>\n"
             + LINE
             + f"\nJoin the <b>{len(missing)}</b> channel(s) below to use this bot.\n\n"
-            f"📊 Progress: {progress_bar(joined, total)} <b>{joined}/{total}</b>\n"
+            f"□ Progress: {progress_bar(joined, total)} <b>{joined}/{total}</b>\n"
             + LINE
-            + "\nAfter joining, tap <b>✅ I Have Joined</b>."
+            + "\nAfter joining, tap <b>✓ I Have Joined</b>."
         )
     rows = []
     for ch in missing:
         if ch["link"]:
-            rows.append([InlineKeyboardButton(f"📢 Join Channel {ch['n']}  ↗", url=ch["link"])])
-    rows.append([InlineKeyboardButton("✅ I Have Joined", callback_data="recheck")])
+            rows.append([InlineKeyboardButton(f"◇ Join Channel {ch['n']}  ↗", url=ch["link"])])
+    rows.append([InlineKeyboardButton("✓ I Have Joined", callback_data="recheck")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -466,7 +516,7 @@ _scan_lock = asyncio.Lock()
 
 async def get_last_message_id() -> int:
     try:
-        tmp = await app.send_message(DB_CHANNEL, "🔄 indexing...", disable_notification=True)
+        tmp = await app.send_message(DB_CHANNEL, "¤ indexing...", disable_notification=True)
         last_id = tmp.id
         try:
             await tmp.delete()
@@ -526,35 +576,127 @@ async def help_cmd(_, m: Message):
 # ----------------------------------------------------------------------------
 # ADMIN COMMANDS
 # ----------------------------------------------------------------------------
-@app.on_message(filters.command("stats") & filters.private & filters.user(ADMINS))
+@app.on_message(filters.command("stats") & filters.private & admin_filter)
 async def stats_cmd(_, m: Message):
     files = await store.count_files()
     users = await store.count_users()
     channels = len(await get_force_channels())
-    kind = "MongoDB ✅ (permanent)" if store.persistent else "SQLite ⚠️ (may be lost on restart)"
+    kind = "MongoDB ✓ (permanent)" if store.persistent else "SQLite ▲ (may be lost on restart)"
     await m.reply(
-        "📊 <b>Bot Statistics</b>\n"
+        "□ <b>Bot Statistics</b>\n"
         + LINE
-        + f"\n🎬 Files: <b>{files}</b>\n"
-        f"👥 Users: <b>{users}</b>\n"
-        f"📢 Force-join channels: <b>{channels}</b>\n"
-        f"🔗 Auto-forward groups: <b>{len(SOURCE_GROUPS)}</b>\n"
-        f"⏳ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'off'}"
+        + f"\n☆ Files: <b>{files}</b>\n"
+        f"♧ Users: <b>{users}</b>\n"
+        f"♛ Admins: <b>{len(ALL_ADMINS)}</b>\n"
+        f"◇ Force-join channels: <b>{channels}</b>\n"
+        f"¤ Auto-forward groups: <b>{len(SOURCE_GROUPS)}</b>\n"
+        f"◇ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'off'}"
         f"{' min' if AUTO_DELETE_SECONDS > 0 else ''}</b>\n"
-        f"💾 Database: {kind}\n"
-        f"⏱ Uptime: <b>{fmt_uptime(time.time() - START_TIME)}</b>\n"
+        f"□ Database: {kind}\n"
+        f"◇ Uptime: <b>{fmt_uptime(time.time() - START_TIME)}</b>\n"
         + LINE,
         quote=True,
     )
 
 
-@app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
+# ---------- ADD / REMOVE ADMINS (only owners from env ADMINS) ----------
+async def resolve_target(client: Client, m: Message):
+    """User id from: reply, numeric id or @username."""
+    if m.reply_to_message and m.reply_to_message.from_user:
+        return m.reply_to_message.from_user.id
+    if len(m.command) > 1:
+        arg = m.command[1].lstrip("@")
+        if arg.lstrip("-").isdigit():
+            return int(arg)
+        try:
+            return (await client.get_users(arg)).id
+        except Exception:
+            return None
+    return None
+
+
+@app.on_message(filters.command("addadmin") & filters.private & owner_filter)
+async def addadmin_cmd(client: Client, m: Message):
+    uid = await resolve_target(client, m)
+    if not uid:
+        return await m.reply(
+            "♤ <b>Add Admin</b>\n"
+            + LINE
+            + "\n<code>/addadmin 123456789</code>\n"
+            "<code>/addadmin @username</code>\n"
+            "or <b>reply</b> to a user's message with <code>/addadmin</code>",
+            quote=True,
+        )
+    if uid in ALL_ADMINS:
+        return await m.reply("¤ This user is already an admin.", quote=True)
+    ALL_ADMINS.add(uid)
+    await save_admins()
+    await set_menu_commands()
+    try:
+        await client.send_message(
+            uid, "♛ <b>Congratulations!</b> You are now an <b>Admin</b> of this bot. Send /help to see the commands."
+        )
+    except Exception:
+        pass
+    await m.reply(f"✓ <b>Admin Added</b>\n{LINE}\n♡ ID: <code>{uid}</code>", quote=True)
+
+
+@app.on_message(filters.command("deladmin") & filters.private & owner_filter)
+async def deladmin_cmd(client: Client, m: Message):
+    uid = await resolve_target(client, m)
+    if not uid:
+        return await m.reply("Usage: <code>/deladmin 123456789</code> or reply to the user.", quote=True)
+    if uid in ADMINS:
+        return await m.reply("¤ Owners (set in env ADMINS) can't be removed.", quote=True)
+    if uid not in ALL_ADMINS:
+        return await m.reply("¤ This user is not an admin.", quote=True)
+    ALL_ADMINS.discard(uid)
+    await save_admins()
+    try:
+        await client.set_bot_commands(
+            [BotCommand("start", "Start the bot"), BotCommand("help", "How to use")],
+            scope=BotCommandScopeChat(uid),
+        )
+    except Exception:
+        pass
+    await m.reply(f"✗ <b>Admin Removed</b>\n{LINE}\n♡ ID: <code>{uid}</code>", quote=True)
+
+
+@app.on_message(filters.command("admins") & filters.private & admin_filter)
+async def admins_cmd(_, m: Message):
+    lines = [f"{'♛ Owner' if a in ADMINS else '♡ Admin'}  <code>{a}</code>" for a in sorted(ALL_ADMINS)]
+    await m.reply("♛ <b>Admins</b>\n" + LINE + "\n" + "\n".join(lines), quote=True)
+
+
+# ---------- START IMAGE (admin only) ----------
+@app.on_message(filters.command("setstart") & filters.private & admin_filter)
+async def setstart_cmd(_, m: Message):
+    src = m.reply_to_message if (m.reply_to_message and m.reply_to_message.photo) else m
+    if not src.photo:
+        return await m.reply(
+            "☆ <b>Set Start Image</b>\n"
+            + LINE
+            + "\nSend a photo with the caption <code>/setstart</code>,\n"
+            "or <b>reply</b> to a photo with <code>/setstart</code>.",
+            quote=True,
+        )
+    await store.set_meta("start_pic", src.photo.file_id)
+    await m.reply_photo(src.photo.file_id, caption="✓ <b>Start image updated!</b>", quote=True)
+
+
+@app.on_message(filters.command("delstart") & filters.private & admin_filter)
+async def delstart_cmd(_, m: Message):
+    await store.set_meta("start_pic", "")
+    await m.reply("✗ Start image removed.", quote=True)
+
+
+@app.on_message(filters.command("broadcast") & filters.private & admin_filter)
 async def broadcast_cmd(client: Client, m: Message):
     src = m.reply_to_message
     text = m.text.split(None, 1)[1] if len(m.command) > 1 else None
     if not src and not text:
         return await m.reply(
-            "📢 <b>Broadcast</b>\n"
+            "◇ <b>Broadcast</b>\n"
             + LINE
             + "\n<b>Reply</b> to a message with <code>/broadcast</code>,\n"
             "or directly: <code>/broadcast your message</code>",
@@ -565,11 +707,11 @@ async def broadcast_cmd(client: Client, m: Message):
         if src:
             await src.copy(uid)
         else:
-            await client.send_message(uid, text, disable_web_page_preview=True)
+            await client.send_message(uid, text, link_preview_options=NO_PREVIEW)
 
     user_ids = await store.all_user_ids()
     total = len(user_ids)
-    status = await m.reply(f"📢 Starting broadcast... <b>{total}</b> users", quote=True)
+    status = await m.reply(f"◇ Starting broadcast... <b>{total}</b> users", quote=True)
     ok = blocked = fail = 0
     last_edit = time.time()
 
@@ -591,25 +733,25 @@ async def broadcast_cmd(client: Client, m: Message):
             last_edit = time.time()
             try:
                 await status.edit_text(
-                    f"📢 Broadcast in progress...\n{progress_bar(i, total)} <b>{i}/{total}</b>"
+                    f"◇ Broadcast in progress...\n{progress_bar(i, total)} <b>{i}/{total}</b>"
                 )
             except Exception:
                 pass
         await asyncio.sleep(0.05)
 
     await status.edit_text(
-        "✅ <b>Broadcast Complete</b>\n"
+        "✓ <b>Broadcast Complete</b>\n"
         + LINE
-        + f"\n📨 Sent: <b>{ok}</b>\n"
-        f"🚫 Blocked/Deleted (removed from list): <b>{blocked}</b>\n"
-        f"⚠️ Failed: <b>{fail}</b>"
+        + f"\n◇ Sent: <b>{ok}</b>\n"
+        f"✗ Blocked/Deleted (removed from list): <b>{blocked}</b>\n"
+        f"▲ Failed: <b>{fail}</b>"
     )
 
 
-@app.on_message(filters.command("index") & filters.private & filters.user(ADMINS))
+@app.on_message(filters.command("index") & filters.private & admin_filter)
 async def index_cmd(_, m: Message):
     full = len(m.command) > 1 and m.command[1].lower() == "full"
-    status = await m.reply("⏳ Scanning the DB channel, please wait...", quote=True)
+    status = await m.reply("◇ Scanning the DB channel, please wait...", quote=True)
     last_edit = [0.0]
 
     async def progress(done, total, found):
@@ -618,8 +760,8 @@ async def index_cmd(_, m: Message):
         last_edit[0] = time.time()
         try:
             await status.edit_text(
-                f"⏳ Scan in progress...\n{progress_bar(done, total)} <b>{done}/{total}</b>\n"
-                f"🎬 Files found: <b>{found}</b>"
+                f"◇ Scan in progress...\n{progress_bar(done, total)} <b>{done}/{total}</b>\n"
+                f"☆ Files found: <b>{found}</b>"
             )
         except Exception:
             pass
@@ -628,20 +770,20 @@ async def index_cmd(_, m: Message):
         found, last_id = await scan_db_channel(full=full, progress=progress)
     except Exception as e:
         return await status.edit_text(
-            f"❌ <b>Scan failed</b>\n{esc(e)}\n\nIs the bot an admin in the DB channel and able to post? Please check."
+            f"✗ <b>Scan failed</b>\n{esc(e)}\n\nIs the bot an admin in the DB channel and able to post? Please check."
         )
     total = await store.count_files()
     await status.edit_text(
-        "✅ <b>Scan Complete</b>\n"
+        "✓ <b>Scan Complete</b>\n"
         + LINE
-        + f"\n📥 Found this time: <b>{found}</b> files\n"
-        f"🎬 Total indexed: <b>{total}</b>\n"
-        f"🆔 Last message id: <code>{last_id}</code>"
+        + f"\n□ Found this time: <b>{found}</b> files\n"
+        f"☆ Total indexed: <b>{total}</b>\n"
+        f"¤ Last message id: <code>{last_id}</code>"
     )
 
 
 ADDCHANNEL_USAGE = (
-    "➕ <b>Add Force-Join Channel</b>\n"
+    "+ <b>Add Force-Join Channel</b>\n"
     + LINE
     + "\n<code>/addchannel 1 @username</code>\n"
     "<code>/addchannel 2 -1001234567890</code>\n"
@@ -652,7 +794,7 @@ ADDCHANNEL_USAGE = (
 )
 
 
-@app.on_message(filters.command("addchannel") & filters.private & filters.user(ADMINS))
+@app.on_message(filters.command("addchannel") & filters.private & admin_filter)
 async def addchannel_cmd(client: Client, m: Message):
     args = m.command[1:]
     if not args:
@@ -665,12 +807,12 @@ async def addchannel_cmd(client: Client, m: Message):
         slot = next((i for i in range(1, 11) if i not in used), None)
         if slot is None:
             return await m.reply(
-                "⚠️ All 10 slots are full. Give a slot number to replace one, or use /delchannel.",
+                "▲ All 10 slots are full. Give a slot number to replace one, or use /delchannel.",
                 quote=True,
             )
         rest = args
     if not 1 <= slot <= 10:
-        return await m.reply("⚠️ Slot must be between 1 and 10.", quote=True)
+        return await m.reply("▲ Slot must be between 1 and 10.", quote=True)
 
     ref = parse_chat(rest[0])
     link = rest[1] if len(rest) > 1 else ""
@@ -679,7 +821,7 @@ async def addchannel_cmd(client: Client, m: Message):
         chat = await client.get_chat(ref)
     except Exception as e:
         return await m.reply(
-            f"❌ <b>Channel not found</b>\n{esc(e)}\n\nFirst make the bot an <b>admin</b> in that channel, then run the command again.",
+            f"✗ <b>Channel not found</b>\n{esc(e)}\n\nFirst make the bot an <b>admin</b> in that channel, then run the command again.",
             quote=True,
         )
 
@@ -703,22 +845,22 @@ async def addchannel_cmd(client: Client, m: Message):
 
     note = ""
     if not is_admin:
-        note += "\n⚠️ The bot doesn't appear to be an admin in this channel. The join check will only work once it is."
+        note += "\n▲ The bot doesn't appear to be an admin in this channel. The join check will only work once it is."
     if not link:
-        note += "\n⚠️ This is a private channel and no link was found. Add an invite link at the end of the command."
+        note += "\n▲ This is a private channel and no link was found. Add an invite link at the end of the command."
     await m.reply(
-        "✅ <b>Channel Added</b>\n"
+        "✓ <b>Channel Added</b>\n"
         + LINE
-        + f"\n📌 Slot: <b>{slot}</b>\n"
-        f"📢 Name: <b>{esc(chat.title)}</b>\n"
-        f"🆔 ID: <code>{chat.id}</code>\n"
-        f"🔗 Link: {esc(link) or 'none'}{note}",
+        + f"\n♤ Slot: <b>{slot}</b>\n"
+        f"◇ Name: <b>{esc(chat.title)}</b>\n"
+        f"¤ ID: <code>{chat.id}</code>\n"
+        f"¤ Link: {esc(link) or 'none'}{note}",
         quote=True,
-        disable_web_page_preview=True,
+        link_preview_options=NO_PREVIEW,
     )
 
 
-@app.on_message(filters.command("delchannel") & filters.private & filters.user(ADMINS))
+@app.on_message(filters.command("delchannel") & filters.private & admin_filter)
 async def delchannel_cmd(_, m: Message):
     if len(m.command) < 2 or not m.command[1].isdigit():
         return await m.reply("Usage: <code>/delchannel 1</code>", quote=True)
@@ -726,18 +868,18 @@ async def delchannel_cmd(_, m: Message):
     await store.del_channel(slot)
     if any(c["n"] == slot for c in ENV_CHANNELS):
         await store.set_channel(slot, "", "")  # disable the slot that comes from env
-    await m.reply(f"🗑 Slot <b>{slot}</b> removed.", quote=True)
+    await m.reply(f"✗ Slot <b>{slot}</b> removed.", quote=True)
 
 
-@app.on_message(filters.command("channels") & filters.private & filters.user(ADMINS))
+@app.on_message(filters.command("channels") & filters.private & admin_filter)
 async def channels_cmd(client: Client, m: Message):
     chans = await get_force_channels()
     if not chans:
-        return await m.reply("📭 No force-join channels are set. Use /addchannel.", quote=True)
+        return await m.reply("□ No force-join channels are set. Use /addchannel.", quote=True)
 
     blocks = []
     for c in chans:
-        title, bot_ok = "❓ Not found", False
+        title, bot_ok = "? Not found", False
         try:
             chat = await client.get_chat(c["ref"])
             title = chat.title
@@ -747,14 +889,14 @@ async def channels_cmd(client: Client, m: Message):
             pass
         blocks.append(
             f"<b>{c['n']}. {esc(title)}</b>\n"
-            f"🆔 <code>{c['ref']}</code>\n"
-            f"🔗 {esc(c['link']) or 'no link'}\n"
-            f"🛡 Bot: {'✅ Admin' if bot_ok else '⚠️ Not admin'}"
+            f"¤ <code>{c['ref']}</code>\n"
+            f"¤ {esc(c['link']) or 'no link'}\n"
+            f"♤ Bot: {'✓ Admin' if bot_ok else '▲ Not admin'}"
         )
     await m.reply(
-        "📢 <b>Force-Join Channels</b>\n" + LINE + "\n" + "\n\n".join(blocks),
+        "◇ <b>Force-Join Channels</b>\n" + LINE + "\n" + "\n\n".join(blocks),
         quote=True,
-        disable_web_page_preview=True,
+        link_preview_options=NO_PREVIEW,
     )
 
 
@@ -791,14 +933,14 @@ async def build_page(query: str, page: int, token: str):
     chunk = results[page * RESULTS_PER_PAGE:(page + 1) * RESULTS_PER_PAGE]
 
     text = (
-        "🔎 <b>Search Results</b>\n"
+        "¤ <b>Search Results</b>\n"
         + LINE
-        + f"\n📝 Query: <i>{esc(query[:60])}</i>\n"
-        f"📦 Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
+        + f"\n□ Query: <i>{esc(query[:60])}</i>\n"
+        f"□ Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
     )
     if fuzzy:
-        text += "🔀 <i>No exact match found, showing similar results</i>\n"
-    text += LINE + "\n👇 <b>Choose your file</b>"
+        text += "¤ <i>No exact match found, showing similar results</i>\n"
+    text += LINE + "\n▼ <b>Choose your file</b>"
 
     rows = [
         [
@@ -813,19 +955,19 @@ async def build_page(query: str, page: int, token: str):
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("« Prev", callback_data=f"pg|{page - 1}|{token}"))
-        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton(f"□ {page + 1}/{pages}", callback_data="noop"))
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next »", callback_data=f"pg|{page + 1}|{token}"))
         rows.append(nav)
-    rows.append([InlineKeyboardButton("× Close ×", callback_data="close")])
+    rows.append([btn("× Close ×", RED, callback_data="close")])
     return text, InlineKeyboardMarkup(rows)
 
 
 NOT_FOUND_TEXT = (
-    "😕 <b>Nothing Found</b>\n"
+    "¤ <b>Nothing Found</b>\n"
     + LINE
-    + "\n🔎 <i>{query}</i>\n\n"
-    "💡 <b>Try this:</b>\n"
+    + "\n¤ <i>{query}</i>\n\n"
+    "♤ <b>Try this:</b>\n"
     "• Check the spelling\n"
     "• Use a shorter name (just the main word)\n"
     "• Try both Hindi and English\n"
@@ -837,7 +979,10 @@ NOT_FOUND_TEXT = (
     filters.text
     & filters.private
     & ~filters.command(
-        ["start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index"]
+        [
+            "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
+            "addadmin", "deladmin", "admins", "setstart", "delstart",
+        ]
     )
 )
 async def search_handler(client: Client, m: Message):
@@ -860,8 +1005,8 @@ async def search_handler(client: Client, m: Message):
     if not text:
         rows = []
         if SUPPORT_USERNAME:
-            rows.append([InlineKeyboardButton("💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}")])
-        rows.append([InlineKeyboardButton("× Close ×", callback_data="close")])
+            rows.append([btn("♡ Support", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
+        rows.append([btn("× Close ×", RED, callback_data="close")])
         reply = await m.reply(
             NOT_FOUND_TEXT.format(query=esc(query[:60])),
             reply_markup=InlineKeyboardMarkup(rows),
@@ -885,7 +1030,7 @@ async def recheck_cb(client: Client, cq: CallbackQuery):
         text, kb = await join_view(missing)
         await edit(cq.message, text, kb)
         return
-    await cq.answer("🎉 Thank you! Now send the name of a Movie/Series.")
+    await cq.answer("☆ Thank you! Now send the name of a Movie/Series.")
     await edit(cq.message, welcome_text(cq.from_user), home_keyboard())
 
 
@@ -938,13 +1083,13 @@ def file_caption(title: str, size: int) -> str:
     text = (
         f"{file_icon(title)} <b>{esc(title[:200])}</b>\n"
         + LINE
-        + f"\n💾 Size: <b>{human(size)}</b>\n"
+        + f"\n□ Size: <b>{human(size)}</b>\n"
     )
     if AUTO_DELETE_SECONDS > 0:
-        text += f"⏳ Auto-delete: <b>{minutes()} min</b>\n"
-    text += LINE + "\n✅ <i>Save or forward it now</i>"
+        text += f"◇ Auto-delete: <b>{minutes()} min</b>\n"
+    text += LINE + "\n✓ <i>Save or forward it now</i>"
     if BOT_USERNAME:
-        text += f"\n🤖 @{BOT_USERNAME}"
+        text += f"\n♧ @{BOT_USERNAME}"
     return text[:1024]
 
 
@@ -982,7 +1127,7 @@ async def get_cb(client: Client, cq: CallbackQuery):
             log.error("Error while sending file: %s", e)
             return await cq.answer("Couldn't get the file, please try again later.", show_alert=True)
 
-    await cq.answer("📥 File sent ✅")
+    await cq.answer("□ File sent ✓")
     schedule_delete(sent)
 
 
@@ -990,7 +1135,7 @@ async def get_cb(client: Client, cq: CallbackQuery):
 # START
 # ----------------------------------------------------------------------------
 async def notify_admins(text: str):
-    for admin in ADMINS[:5]:
+    for admin in list(ALL_ADMINS)[:5]:
         try:
             await app.send_message(admin, text)
         except Exception:
@@ -1002,17 +1147,17 @@ async def _startup_scan():
         found, last_id = await scan_db_channel(full=False)
         total = await store.count_files()
         text = (
-            "✅ <b>Bot Started</b>\n"
+            "✓ <b>Bot Started</b>\n"
             + LINE
-            + f"\n📥 New files indexed: <b>{found}</b>\n"
-            f"🎬 Total files in database: <b>{total}</b>"
+            + f"\n□ New files indexed: <b>{found}</b>\n"
+            f"☆ Total files in database: <b>{total}</b>"
         )
         if not store.persistent:
-            text += "\n⚠️ MONGO_URI is not set, data may be lost on restart."
+            text += "\n▲ MONGO_URI is not set, data may be lost on restart."
         log.info("Startup index: %s new files, total %s", found, total)
     except Exception as e:
         text = (
-            f"❌ <b>Startup index failed</b>\n{esc(e)}\n\n"
+            f"✗ <b>Startup index failed</b>\n{esc(e)}\n\n"
             "Make the bot an admin in the DB channel, then run /index full."
         )
         log.error("Startup index failed: %s", e)
@@ -1022,22 +1167,30 @@ async def _startup_scan():
 async def set_menu_commands():
     """Commands shown in Telegram's command menu (when you tap /)."""
     user_cmds = [
-        BotCommand("start", "🏠 Start the bot"),
-        BotCommand("help", "📖 How to use"),
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "How to use"),
     ]
     admin_cmds = user_cmds + [
-        BotCommand("stats", "📊 Bot statistics"),
-        BotCommand("broadcast", "📢 Message everyone"),
-        BotCommand("index", "🗂 Index the DB channel"),
-        BotCommand("addchannel", "➕ Add force-join channel"),
-        BotCommand("delchannel", "🗑 Remove a channel"),
-        BotCommand("channels", "📋 List channels"),
+        BotCommand("stats", "Bot statistics"),
+        BotCommand("broadcast", "Message everyone"),
+        BotCommand("index", "Index the DB channel"),
+        BotCommand("addchannel", "Add force-join channel"),
+        BotCommand("delchannel", "Remove a channel"),
+        BotCommand("channels", "List channels"),
+        BotCommand("setstart", "Set start image"),
+        BotCommand("delstart", "Remove start image"),
+        BotCommand("admins", "List admins"),
+    ]
+    owner_cmds = admin_cmds + [
+        BotCommand("addadmin", "Add an admin"),
+        BotCommand("deladmin", "Remove an admin"),
     ]
     try:
         await app.set_bot_commands(user_cmds)
-        for admin in ADMINS:
+        for admin in ALL_ADMINS:
             try:
-                await app.set_bot_commands(admin_cmds, scope=BotCommandScopeChat(admin))
+                cmds = owner_cmds if admin in ADMINS else admin_cmds
+                await app.set_bot_commands(cmds, scope=BotCommandScopeChat(admin))
             except Exception:
                 pass  # may fail if the admin hasn't started the bot yet
     except Exception as e:
@@ -1047,9 +1200,11 @@ async def set_menu_commands():
 async def main():
     global BOT_USERNAME
     await store.init()
+    await load_admins()
     await app.start()
     BOT_USERNAME = (await app.get_me()).username or ""
     log.info("Bot started: @%s", BOT_USERNAME)
+    log.info("Admins: %s", sorted(ALL_ADMINS))
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
