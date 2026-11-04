@@ -41,6 +41,18 @@ class SqliteStore:
         )
         self.db.commit()
 
+    async def delete_file(self, msg_id: int) -> bool:
+        """Removes one file from the database. True if it existed."""
+        cur = self.db.execute("DELETE FROM files WHERE msg_id=?", (msg_id,))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    async def clear_files(self) -> int:
+        """Removes ALL files from the database. Returns how many were removed."""
+        cur = self.db.execute("DELETE FROM files")
+        self.db.commit()
+        return cur.rowcount
+
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
         if not words:
             return []
@@ -148,6 +160,16 @@ class MongoStore:
             },
             upsert=True,
         )
+
+    async def delete_file(self, msg_id: int) -> bool:
+        """Removes one file from the database. True if it existed."""
+        res = await self.db.files.delete_one({"_id": msg_id})
+        return res.deleted_count > 0
+
+    async def clear_files(self) -> int:
+        """Removes ALL files from the database. Returns how many were removed."""
+        res = await self.db.files.delete_many({})
+        return res.deleted_count
 
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
         if not words:
