@@ -28,7 +28,7 @@ from pyrogram.types import (
     Message,
 )
 
-from quality import detect_quality, quality_counts
+from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
 from storage import MongoStore, SqliteStore
 
 load_dotenv()
@@ -348,7 +348,7 @@ def welcome_text(user) -> str:
     )
 
 
-def help_text(is_admin: bool) -> str:
+def help_text(is_admin: bool, is_owner: bool = False) -> str:
     text = (
         "☆ <b>How To Use</b>\n"
         + LINE
@@ -358,7 +358,7 @@ def help_text(is_admin: bool) -> str:
         + LINE
         + "\n♤ <b>Tips</b>\n"
         "• Use a short and simple name\n"
-        "• Tap a quality button (1080p / 720p / 480p) to filter the files\n"
+        "• Use the quality / language / season buttons to filter the files\n"
         "• Double-check the spelling\n"
         "• Movie/Series name only, like <code>KGF </code>"
     )
@@ -375,6 +375,15 @@ def help_text(is_admin: bool) -> str:
             "/setstart - set the start image (send a photo with caption or reply to a photo)\n"
             "/delstart - remove the start image\n"
             "/admins - list admins"
+        )
+    if is_owner:
+        text += (
+            "\n\n♔ <b>Owner Commands</b>\n"
+            + LINE
+            + "\n/addadmin - add an admin\n"
+            "/deladmin - remove an admin\n"
+            "/del - delete a file from the database (<code>/del name</code> or <code>/del id</code>)\n"
+            "/dbset - set the database channel (<code>/dbset -100...</code>)"
         )
     return text
 
@@ -513,7 +522,14 @@ async def index_message(m: Message) -> bool:
 
 
 # Any new file posted in the DB channel is indexed automatically
-@app.on_message(filters.chat(DB_CHANNEL) & (filters.document | filters.video | filters.audio))
+async def _in_db_channel(_, __, m):
+    return bool(m.chat) and m.chat.id == DB_CHANNEL
+
+
+db_channel_filter = filters.create(_in_db_channel)  # follows DB_CHANNEL even after /dbset
+
+
+@app.on_message(db_channel_filter & (filters.document | filters.video | filters.audio))
 async def index_file(_, m: Message):
     await index_message(m)
 
@@ -612,7 +628,7 @@ async def start_cmd(client: Client, m: Message):
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_cmd(_, m: Message):
-    await m.reply(help_text(is_admin_id(m.from_user.id)), reply_markup=back_keyboard(), quote=True)
+    await m.reply(help_text(is_admin_id(m.from_user.id), m.from_user.id in ADMINS), reply_markup=back_keyboard(), quote=True)
 
 
 # ----------------------------------------------------------------------------
@@ -944,20 +960,234 @@ async def channels_cmd(client: Client, m: Message):
 
 
 # ----------------------------------------------------------------------------
+# OWNER COMMANDS: /del (delete a file from the database) and /dbset (set the DB channel)
+# Only the owners from env ADMINS can use these.
+# ----------------------------------------------------------------------------
+def del_confirm_view(row: dict):
+    title = row.get("title") or f"file_{row['msg_id']}"
+    mid = row["msg_id"]
+    text = (
+        "✗ <b>Delete This File?</b>\n"
+        + LINE
+        + f"\n{file_icon(title)} <b>{esc(title[:200])}</b>\n"
+        f"□ Size: <b>{human(row.get('size', 0))}</b>\n"
+        f"¤ Message id: <code>{mid}</code>\n"
+        + LINE
+        + "\n<b>DB Only</b> = removed from search, the file stays in the channel "
+        "(it comes back if you run /index full).\n"
+        "<b>DB + Channel</b> = also deleted from the DB channel."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                btn("✗ DB Only", RED, callback_data=f"dly|{mid}|db"),
+                btn("✗ DB + Channel", RED, callback_data=f"dly|{mid}|all"),
+            ],
+            [InlineKeyboardButton("« Cancel", callback_data="dln")],
+        ]
+    )
+    return text, kb
+
+
+@app.on_message(filters.command("del") & filters.private & owner_filter)
+async def del_cmd(_, m: Message):
+    arg = m.text.split(None, 1)[1].strip() if len(m.command) > 1 else ""
+    if not arg:
+        return await m.reply(
+            "✗ <b>Delete File</b>\n"
+            + LINE
+            + "\n<code>/del KGF</code> - search and pick the file to delete\n"
+            "<code>/del 1234</code> - delete by message id (DB channel)\n"
+            + LINE,
+            quote=True,
+        )
+
+    if arg.lstrip("#").isdigit():
+        row = await store.get_file(int(arg.lstrip("#")))
+        if not row:
+            return await m.reply("¤ No file with this id in the database.", quote=True)
+        text, kb = del_confirm_view(row)
+        return await m.reply(text, reply_markup=kb, quote=True)
+
+    results = await store.find(norm(arg).split())
+    if not results:
+        return await m.reply("¤ Nothing found. Try a shorter name.", quote=True)
+    shown = results[:10]
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"✗ {human(size)} ┃ {title[:38]}", callback_data=f"dl|{mid}"
+            )
+        ]
+        for mid, title, size in shown
+    ]
+    rows.append([InlineKeyboardButton("« Cancel", callback_data="dln")])
+    more = f"\n▲ Showing 10 of {len(results)}. Use a more specific name." if len(results) > 10 else ""
+    await m.reply(
+        "✗ <b>Pick The File To Delete</b>\n" + LINE + f"\n□ Found: <b>{len(results)}</b>{more}",
+        reply_markup=InlineKeyboardMarkup(rows),
+        quote=True,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^dl\|"))
+async def del_pick_cb(_, cq: CallbackQuery):
+    if cq.from_user.id not in ADMINS:
+        return await cq.answer("Only the owner can do this.", show_alert=True)
+    row = await store.get_file(int(cq.data.split("|")[1]))
+    if not row:
+        return await cq.answer("This file is already removed.", show_alert=True)
+    text, kb = del_confirm_view(row)
+    await edit(cq.message, text, kb)
+    await cq.answer()
+
+
+@app.on_callback_query(filters.regex(r"^dly\|"))
+async def del_yes_cb(client: Client, cq: CallbackQuery):
+    if cq.from_user.id not in ADMINS:
+        return await cq.answer("Only the owner can do this.", show_alert=True)
+    _, mid, mode = cq.data.split("|")
+    mid = int(mid)
+    row = await store.get_file(mid)
+    title = (row or {}).get("title") or f"file_{mid}"
+    existed = await store.delete_file(mid)
+    lines = ["✓ Removed from the database." if existed else "¤ It was not in the database."]
+    if mode == "all":
+        try:
+            await client.delete_messages(DB_CHANNEL, mid)
+            lines.append("✓ Deleted from the DB channel.")
+        except Exception as e:
+            lines.append(f"▲ Could not delete from the channel: {esc(e)}")
+    await edit(
+        cq.message,
+        "✓ <b>Done</b>\n" + LINE + f"\n{file_icon(title)} <b>{esc(title[:200])}</b>\n" + "\n".join(lines),
+    )
+    await cq.answer("Deleted ✓")
+
+
+@app.on_callback_query(filters.regex(r"^dln$"))
+async def del_no_cb(_, cq: CallbackQuery):
+    await edit(cq.message, "✗ Cancelled.")
+    await cq.answer()
+
+
+@app.on_message(filters.command("dbset") & filters.private & owner_filter)
+async def dbset_cmd(client: Client, m: Message):
+    if len(m.command) < 2:
+        files = await store.count_files()
+        return await m.reply(
+            "♤ <b>Database Channel</b>\n"
+            + LINE
+            + f"\n¤ Current: <code>{DB_CHANNEL}</code>\n"
+            f"☆ Files indexed: <b>{files}</b>\n"
+            + LINE
+            + "\n<code>/dbset -1001234567890</code>\n"
+            "<code>/dbset @channelusername</code>\n\n"
+            "The bot must be an <b>admin</b> in the new channel.",
+            quote=True,
+        )
+
+    ref = parse_chat(m.command[1])
+    try:
+        chat = await client.get_chat(ref)
+    except Exception as e:
+        return await m.reply(
+            f"✗ <b>Channel not found</b>\n{esc(e)}\n\nFirst make the bot an <b>admin</b> in that channel, then try again.",
+            quote=True,
+        )
+
+    try:
+        me = await client.get_chat_member(chat.id, "me")
+        bot_ok = me.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+    except Exception:
+        bot_ok = False
+    if not bot_ok:
+        return await m.reply(
+            f"✗ The bot is not an <b>admin</b> in <b>{esc(chat.title)}</b>.\nMake it an admin and run the command again.",
+            quote=True,
+        )
+    if chat.id == DB_CHANNEL:
+        return await m.reply("¤ This is already the database channel.", quote=True)
+
+    kb = InlineKeyboardMarkup(
+        [
+            [btn("✓ Keep Old Files", GREEN, callback_data=f"dbs|keep|{chat.id}")],
+            [btn("✗ Clear Old Files", RED, callback_data=f"dbs|clear|{chat.id}")],
+            [InlineKeyboardButton("« Cancel", callback_data="dln")],
+        ]
+    )
+    await m.reply(
+        "♤ <b>Change Database Channel?</b>\n"
+        + LINE
+        + f"\n◇ New: <b>{esc(chat.title)}</b>\n"
+        f"¤ ID: <code>{chat.id}</code>\n"
+        f"☆ Files in database now: <b>{await store.count_files()}</b>\n"
+        + LINE
+        + "\n<b>Keep Old Files</b> = old files stay searchable (they are sent with their saved file id). "
+        "Message ids start from 1 in every channel, so a few old entries can get replaced.\n"
+        "<b>Clear Old Files</b> = the database is emptied and only the new channel is indexed.\n\n"
+        "The new channel is scanned fully after you choose.",
+        reply_markup=kb,
+        quote=True,
+    )
+
+
+async def _scan_after_dbset(msg: Message):
+    try:
+        found, last_id = await scan_db_channel(full=True)
+        total = await store.count_files()
+        text = (
+            "✓ <b>Database Channel Updated</b>\n"
+            + LINE
+            + f"\n□ Files found in new channel: <b>{found}</b>\n"
+            f"☆ Total in database: <b>{total}</b>\n"
+            f"¤ Last message id: <code>{last_id}</code>"
+        )
+    except Exception as e:
+        text = (
+            f"▲ <b>Channel saved, but the scan failed</b>\n{esc(e)}\n\n"
+            "Make sure the bot is an admin there and can post, then run /index full."
+        )
+    await edit(msg, text)
+
+
+@app.on_callback_query(filters.regex(r"^dbs\|"))
+async def dbset_cb(client: Client, cq: CallbackQuery):
+    global DB_CHANNEL
+    if cq.from_user.id not in ADMINS:
+        return await cq.answer("Only the owner can do this.", show_alert=True)
+    _, mode, cid = cq.data.split("|")
+    if mode == "clear":
+        await store.clear_files()
+    DB_CHANNEL = int(cid)
+    await store.set_meta("db_channel", str(DB_CHANNEL))
+    await store.set_meta("last_scanned", "0")
+    await edit(
+        cq.message,
+        "⏳ <b>Database channel changed.</b>\n" + LINE + f"\n¤ New: <code>{DB_CHANNEL}</code>\nScanning the channel, please wait...".replace("⏳", "◇"),
+    )
+    await cq.answer("Saved ✓")
+    task = asyncio.create_task(_scan_after_dbset(cq.message))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+# ----------------------------------------------------------------------------
 # SEARCH
 # ----------------------------------------------------------------------------
 _search_cache: dict = {}
 
 
-_quality_cache: dict = {}  # token -> selected quality (e.g. "1080p")
+_filter_cache: dict = {}  # token -> {"q": "1080p", "l": "hin", "s": "1"}
 
 
 def cache_query(token: str, query: str):
     _search_cache[token] = query
+    _filter_cache.pop(token, None)
     while len(_search_cache) > 500:
         old = next(iter(_search_cache))
         _search_cache.pop(old)
-        _quality_cache.pop(old, None)
+        _filter_cache.pop(old, None)
 
 
 async def run_search(query: str):
@@ -975,15 +1205,55 @@ async def build_page(query: str, page: int, token: str):
     if not all_results:
         return None, None
 
-    # quality buttons are built from the file names (1080p / 720p / 480p ...)
-    counts = quality_counts(title for _, title, _ in all_results)
-    selected = _quality_cache.get(token)
-    results = all_results
-    if selected:
-        results = [r for r in all_results if detect_quality(r[1]) == selected]
-        if not results:  # that quality is not in this search anymore
-            _quality_cache.pop(token, None)
-            selected, results = None, all_results
+    # quality / language / season are read from the file names
+    metas = [(r, file_meta(r[1])) for r in all_results]
+    sel = _filter_cache.setdefault(token, {})
+
+    def ok(meta, skip=""):
+        q, langs, seasons = meta
+        if skip != "q" and sel.get("q") and q != sel["q"]:
+            return False
+        if skip != "l" and sel.get("l") and sel["l"] not in langs:
+            return False
+        if skip != "s" and sel.get("s") and int(sel["s"]) not in seasons:
+            return False
+        return True
+
+    results = [r for r, meta in metas if ok(meta)]
+    if not results:  # the chosen filters match nothing, show everything again
+        sel.clear()
+        results = list(all_results)
+
+    # options for each filter row (counted with the OTHER filters applied)
+    q_counts, l_counts, s_counts = {}, {}, {}
+    for _, meta in metas:
+        q, langs, seasons = meta
+        if q and ok(meta, "q"):
+            q_counts[q] = q_counts.get(q, 0) + 1
+        if ok(meta, "l"):
+            for lg in langs:
+                l_counts[lg] = l_counts.get(lg, 0) + 1
+        if ok(meta, "s"):
+            for sn in seasons:
+                s_counts[sn] = s_counts.get(sn, 0) + 1
+    q_opts = sorted(q_counts.items(), key=lambda kv: QUALITY_ORDER.index(kv[0]))
+    l_opts = sorted(l_counts.items(), key=lambda kv: LANG_ORDER.index(kv[0]))
+    s_opts = sorted(s_counts.items())
+
+    def facet_rows(kind, options, label, per_row, cap=12):
+        if not options or (len(options) < 2 and not sel.get(kind)):
+            return []
+        buttons = []
+        for value, count in options[:cap]:
+            active = str(sel.get(kind)) == str(value)
+            buttons.append(
+                btn(
+                    f"{'✓ ' if active else ''}{label(value)} ({count})",
+                    GREEN if active else None,
+                    callback_data=f"f|{kind}|{value}|{token}",
+                )
+            )
+        return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
 
     total = len(results)
     pages = max(math.ceil(total / RESULTS_PER_PAGE), 1)
@@ -996,26 +1266,25 @@ async def build_page(query: str, page: int, token: str):
         + f"\n□ Query: <i>{esc(query[:60])}</i>\n"
         f"□ Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
     )
-    if selected:
-        text += f"◇ Quality: <b>{selected}</b>\n"
+    active_parts = []
+    if sel.get("q"):
+        active_parts.append(sel["q"])
+    if sel.get("l"):
+        active_parts.append(LANG_NAMES.get(sel["l"], sel["l"]))
+    if sel.get("s"):
+        active_parts.append(f"S{int(sel['s']):02d}")
+    if active_parts:
+        text += f"◇ Filter: <b>{' • '.join(active_parts)}</b>\n"
     if fuzzy:
         text += "¤ <i>No exact match found, showing similar results</i>\n"
-    text += LINE + "\n▼ <b>Choose quality / file</b>"
+    text += LINE + "\n▼ <b>Choose quality / language / season / file</b>"
 
     rows = []
-    if len(counts) >= 2 or selected:
-        qbtns = [
-            btn(
-                f"{'✓ ' if q == selected else ''}{q} ({c})",
-                GREEN if q == selected else None,
-                callback_data=f"q|{q}|{token}",
-            )
-            for q, c in counts.items()
-        ]
-        for i in range(0, len(qbtns), 3):
-            rows.append(qbtns[i:i + 3])
-        if selected:
-            rows.append([InlineKeyboardButton("◇ All Qualities", callback_data=f"q|all|{token}")])
+    rows += facet_rows("q", q_opts, lambda v: v, 3)
+    rows += facet_rows("l", l_opts, lambda v: LANG_NAMES[v], 3)
+    rows += facet_rows("s", s_opts, lambda v: f"S{v:02d}", 4)
+    if active_parts:
+        rows.append([InlineKeyboardButton("◇ Clear Filters", callback_data=f"f|x|all|{token}")])
 
     rows += [
         [
@@ -1056,7 +1325,7 @@ NOT_FOUND_TEXT = (
     & ~filters.command(
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
-            "addadmin", "deladmin", "admins", "setstart", "delstart",
+            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset",
         ]
     )
 )
@@ -1117,7 +1386,7 @@ async def home_cb(_, cq: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^help$"))
 async def help_cb(_, cq: CallbackQuery):
-    await edit(cq.message, help_text(is_admin_id(cq.from_user.id)), back_keyboard())
+    await edit(cq.message, help_text(is_admin_id(cq.from_user.id), cq.from_user.id in ADMINS), back_keyboard())
     await cq.answer()
 
 
@@ -1142,16 +1411,19 @@ async def close_cb(_, cq: CallbackQuery):
     await cq.answer()
 
 
-@app.on_callback_query(filters.regex(r"^q\|"))
-async def quality_cb(client: Client, cq: CallbackQuery):
-    _, quality, token = cq.data.split("|", 2)
+@app.on_callback_query(filters.regex(r"^f\|"))
+async def filter_cb(client: Client, cq: CallbackQuery):
+    _, kind, value, token = cq.data.split("|", 3)
     query = _search_cache.get(token)
     if not query:
         return await cq.answer("This search has expired, please send the name again.", show_alert=True)
-    if quality == "all" or _quality_cache.get(token) == quality:
-        _quality_cache.pop(token, None)  # pressing the selected quality again clears it
+    sel = _filter_cache.setdefault(token, {})
+    if kind == "x":
+        sel.clear()
+    elif sel.get(kind) == value:
+        sel.pop(kind)  # pressing the selected button again clears it
     else:
-        _quality_cache[token] = quality
+        sel[kind] = value
     text, kb = await build_page(query, 0, token)
     if text:
         await edit(cq.message, text, kb)
@@ -1275,6 +1547,8 @@ async def set_menu_commands():
     owner_cmds = admin_cmds + [
         BotCommand("addadmin", "Add an admin"),
         BotCommand("deladmin", "Remove an admin"),
+        BotCommand("del", "Delete a file from the database"),
+        BotCommand("dbset", "Set the database channel"),
     ]
     try:
         await app.set_bot_commands(user_cmds)
@@ -1289,14 +1563,18 @@ async def set_menu_commands():
 
 
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, DB_CHANNEL
     await store.init()
     await load_admins()
+    saved_db = await store.get_meta("db_channel", "")
+    if saved_db.lstrip("-").isdigit():
+        DB_CHANNEL = int(saved_db)  # channel chosen with /dbset wins over .env
     _known_users.update(await store.all_user_ids())
     await app.start()
     BOT_USERNAME = (await app.get_me()).username or ""
     log.info("Bot started: @%s", BOT_USERNAME)
     log.info("Admins: %s", sorted(ALL_ADMINS))
+    log.info("DB channel: %s", DB_CHANNEL)
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
