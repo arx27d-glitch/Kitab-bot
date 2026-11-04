@@ -29,7 +29,7 @@ from pyrogram.types import (
 )
 
 from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
-from storage import MongoStore, SqliteStore
+from storage import MongoStore, MultiMongoStore, SqliteStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -57,7 +57,19 @@ ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-
 ALL_ADMINS = set(ADMINS)
 
 # Database: provide MONGO_URI so data survives restarts (recommended)
-MONGO_URI = env("MONGO_URI")
+def load_mongo_uris():
+    """MONGO_URI, MONGO_URI_1 ... MONGO_URI_10: any number from 1 to 10 works (gaps are fine)."""
+    keys = ["MONGO_URI"] + [f"MONGO_URI_{i}" for i in range(1, 11)]
+    uris = []
+    for key in keys:
+        value = env(key)
+        if value and value not in uris:
+            uris.append(value)
+    return uris[:10]
+
+
+MONGO_URIS = load_mongo_uris()
+MONGO_LIMIT_MB = int(env("MONGO_LIMIT_MB", "450") or 450)  # a database is "full" at this size
 MONGO_DB_NAME = env("MONGO_DB_NAME", "bookbot")
 DB_PATH = env("DB_PATH", "files.db")  # only used when MONGO_URI is not set
 
@@ -131,8 +143,10 @@ app = Client(
 )
 BOT_USERNAME = ""
 
-if MONGO_URI:
-    store = MongoStore(MONGO_URI, MONGO_DB_NAME)
+if len(MONGO_URIS) > 1:
+    store = MultiMongoStore(MONGO_URIS, MONGO_DB_NAME, MONGO_LIMIT_MB)
+elif MONGO_URIS:
+    store = MongoStore(MONGO_URIS[0], MONGO_DB_NAME)
 else:
     store = SqliteStore(DB_PATH)
     log.warning(
@@ -640,6 +654,16 @@ async def stats_cmd(_, m: Message):
     users = await store.count_users()
     channels = len(await get_force_channels())
     kind = "MongoDB ✓ (permanent)" if store.persistent else "SQLite ▲ (may be lost on restart)"
+    db_lines = ""
+    if hasattr(store, "status"):
+        icons = {"active": "✓ Active", "full": "✗ Full", "standby": "◇ Standby"}
+        try:
+            for d in await store.status():
+                db_lines += (
+                    f"   ◇ DB {d['n']}: {d['used_mb']:.0f} MB • {d['files']} files • {icons[d['state']]}\n"
+                )
+        except Exception as e:
+            log.warning("Could not read database status: %s", e)
     await m.reply(
         "□ <b>Bot Statistics</b>\n"
         + LINE
@@ -650,7 +674,7 @@ async def stats_cmd(_, m: Message):
         f"¤ Auto-forward groups: <b>{len(SOURCE_GROUPS)}</b>\n"
         f"◇ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'off'}"
         f"{' min' if AUTO_DELETE_SECONDS > 0 else ''}</b>\n"
-        f"□ Database: {kind}\n"
+        f"□ Database: {kind}\n{db_lines}"
         f"◇ Uptime: <b>{fmt_uptime(time.time() - START_TIME)}</b>\n"
         + LINE,
         quote=True,
@@ -1565,6 +1589,8 @@ async def set_menu_commands():
 async def main():
     global BOT_USERNAME, DB_CHANNEL
     await store.init()
+    if hasattr(store, "notify"):
+        store.notify = notify_admins  # tells admins when a MongoDB gets full
     await load_admins()
     saved_db = await store.get_meta("db_channel", "")
     if saved_db.lstrip("-").isdigit():
