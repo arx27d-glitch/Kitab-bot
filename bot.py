@@ -131,6 +131,14 @@ ENV_CHANNELS = load_force_channels()
 _log_raw = env("LOG_GROUP")
 LOG_GROUP = parse_chat(_log_raw) if _log_raw else (SOURCE_GROUPS[0] if SOURCE_GROUPS else 0)
 
+# Auto-reply group: user messages are mirrored here, movie requests (not available) and
+# "file sent to user" cards go here, and admins can answer users with /sent.
+# AUTO_REPLY_GROUP not set -> same group as LOG_GROUP.
+_auto_raw = env("AUTO_REPLY_GROUP")
+AUTO_GROUP = parse_chat(_auto_raw) if _auto_raw else LOG_GROUP
+# false = messages of admins/owners are not mirrored (true is handy while testing with your own account)
+MIRROR_ADMINS = env_bool("MIRROR_ADMIN_MESSAGES", "false")
+
 if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
     raise SystemExit("API_ID, API_HASH, BOT_TOKEN and DB_CHANNEL are required (see .env).")
 
@@ -297,10 +305,115 @@ async def log_start(client: Client, user, is_new: bool):
         f"☆ Total users: <b>{await store.count_users()}</b>\n"
         + LINE
     )
+    group_text(LOG_GROUP, text)
+
+
+# ---- everything that goes to the groups is sent through one queue (in order, flood-safe)
+_log_queue = None
+
+
+async def _log_worker():
+    while True:
+        fn = await _log_queue.get()
+        try:
+            try:
+                await fn()
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+                await fn()
+        except Exception as e:
+            log.warning("Could not send to the group (%s). Is the bot added there?", e)
+        await asyncio.sleep(0.4)
+
+
+def enqueue_group(fn):
+    """fn = a function without arguments that returns the coroutine to run."""
+    if _log_queue is None:
+        return
     try:
-        await client.send_message(LOG_GROUP, text, link_preview_options=NO_PREVIEW)
-    except Exception as e:
-        log.warning("Could not send start log to LOG_GROUP (%s). Is the bot added in that group?", e)
+        _log_queue.put_nowait(fn)
+    except asyncio.QueueFull:
+        log.warning("Group queue is full, dropping a message")
+
+
+def group_text(chat, text: str):
+    if chat:
+        enqueue_group(lambda: app.send_message(chat, text, link_preview_options=NO_PREVIEW))
+
+
+def now_ist() -> str:
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
+
+
+def user_tag(user) -> str:
+    uname = f"@{esc(user.username)}" if user.username else "no username"
+    return f"♧ {user.mention} ┃ {uname}\n¤ ID: <code>{user.id}</code>"
+
+
+_NO_CAPTION_TYPES = ("sticker", "video_note", "contact", "location", "venue", "poll", "dice", "game")
+
+
+def mirror_user_message(m: Message):
+    """Copies a message of a user into the auto-reply group (with the user's name + id on top)."""
+    if not AUTO_GROUP:
+        return
+    head = user_tag(m.from_user)
+    if m.text:
+        body = f"{head}\n{LINE}\n{esc(m.text)[:3500]}"
+        enqueue_group(lambda: app.send_message(AUTO_GROUP, body, link_preview_options=NO_PREVIEW))
+        return
+    kind = str(m.media.name).lower().replace("_", " ") if m.media else "message"
+    if any(getattr(m, t, None) for t in _NO_CAPTION_TYPES):
+        note = f"{head}\n{LINE}\n◇ sent a <b>{kind}</b>"
+        enqueue_group(lambda: app.send_message(AUTO_GROUP, note, link_preview_options=NO_PREVIEW))
+        enqueue_group(lambda: m.copy(AUTO_GROUP))
+        return
+    cap = esc(m.caption)[:700] if m.caption else ""
+    caption = f"{head}\n{LINE}\n◇ <b>{kind}</b>" + (f"\n{cap}" if cap else "")
+    enqueue_group(lambda: m.copy(AUTO_GROUP, caption=caption))
+
+
+_req_seen: dict = {}
+
+
+def log_movie_request(user, query: str):
+    """Movie not found -> card in the auto-reply group (same user + same name only once per 10 min)."""
+    if not AUTO_GROUP:
+        return
+    key = (user.id, norm(query))
+    now = time.time()
+    if now - _req_seen.get(key, 0) < 600:
+        return
+    _req_seen[key] = now
+    if len(_req_seen) > 3000:
+        for k in sorted(_req_seen, key=_req_seen.get)[:1500]:
+            _req_seen.pop(k, None)
+    group_text(
+        AUTO_GROUP,
+        "☆ <b>Movie Request</b> ┃ ✗ <b>Not Available</b>\n"
+        + LINE
+        + f"\n{user_tag(user)}\n"
+        f"□ Requested: <i>{esc(query[:100])}</i>\n"
+        f"◇ Time: {now_ist()}\n"
+        + LINE
+        + "\n♤ <i>Reply to this message with</i> <code>/sent your text</code> "
+        "<i>(or send a file with the caption</i> <code>/sent</code><i>) to answer this user.</i>",
+    )
+
+
+def log_file_sent(user, title: str, size: int):
+    if not AUTO_GROUP:
+        return
+    group_text(
+        AUTO_GROUP,
+        "✓ <b>File Sent To This User</b>\n"
+        + LINE
+        + f"\n{user_tag(user)}\n"
+        f"{file_icon(title)} <b>{esc(title[:150])}</b>\n"
+        f"□ Size: <b>{human(size)}</b>\n"
+        f"◇ Time: {now_ist()}",
+    )
 
 
 _tasks = set()
@@ -388,7 +501,8 @@ def help_text(is_admin: bool, is_owner: bool = False) -> str:
             "/channels - list channels and their status\n"
             "/setstart - set the start image (send a photo with caption or reply to a photo)\n"
             "/delstart - remove the start image\n"
-            "/admins - list admins"
+            "/admins - list admins\n"
+            "/sent - send a message/file to a user (<code>/sent user_id text</code>, or reply to a file)"
         )
     if is_owner:
         text += (
@@ -624,6 +738,21 @@ async def scan_db_channel(full: bool = False, progress=None):
         await store.set_meta("last_scanned", str(last_id))
         log.info("Scan finished: %s files indexed (last id %s)", found, last_id)
         return found, last_id
+
+
+# ----------------------------------------------------------------------------
+# MIRROR: every message a user sends to the bot is also posted in the auto-reply group
+# ----------------------------------------------------------------------------
+@app.on_message(filters.private & ~filters.service, group=-1)
+async def mirror_handler(client: Client, m: Message):
+    user = m.from_user
+    if not AUTO_GROUP or not user or user.is_bot:
+        return
+    if user.id in ALL_ADMINS and not MIRROR_ADMINS:
+        return
+    if m.text and m.text.split()[0].split("@")[0].lower() == "/start":
+        return  # /start already has its own card
+    mirror_user_message(m)
 
 
 # ----------------------------------------------------------------------------
@@ -981,6 +1110,93 @@ async def channels_cmd(client: Client, m: Message):
         quote=True,
         link_preview_options=NO_PREVIEW,
     )
+
+
+# ----------------------------------------------------------------------------
+# /sent : admins send a message or a file to a user's DM (works in the bot chat and in the group)
+# ----------------------------------------------------------------------------
+SENT_USAGE = (
+    "✉ <b>Send To User</b>\n"
+    + LINE
+    + "\n<code>/sent 123456789 your message</code> - text to that user\n"
+    "Reply to a file/message with <code>/sent 123456789</code> - sends it to that user\n"
+    "Send a file with the caption <code>/sent 123456789 text</code> - file + text\n\n"
+    "<b>In the auto-reply group:</b> reply to the user's card/message with\n"
+    "<code>/sent your text</code> (or a file with caption <code>/sent text</code>) - no id needed.\n"
+    + LINE
+)
+
+
+def target_from_card(reply) -> int:
+    """User id from a card/mirrored message that the BOT posted (the 'ID: 123' line)."""
+    if reply and reply.from_user and getattr(reply.from_user, "is_self", False):
+        found = re.search(r"ID:\s*(\d{4,15})", reply.text or reply.caption or "")
+        if found:
+            return int(found.group(1))
+    return 0
+
+
+def media_file_id(msg):
+    if not msg or not msg.media:
+        return None
+    return getattr(getattr(msg, msg.media.value, None), "file_id", None)
+
+
+@app.on_message(filters.command("sent") & admin_filter)
+async def sent_cmd(client: Client, m: Message):
+    raw = (m.text or m.caption or "").strip()
+    pieces = raw.split(None, 2)
+    reply = m.reply_to_message
+    explicit = len(pieces) >= 2 and re.fullmatch(r"\d{5,15}", pieces[1]) is not None
+    if explicit:
+        uid = int(pieces[1])
+        rest = pieces[2].strip() if len(pieces) > 2 else ""
+    else:
+        uid = target_from_card(reply)
+        rest = raw.split(None, 1)[1].strip() if len(pieces) > 1 else ""
+    if not uid:
+        return await m.reply(SENT_USAGE, quote=True)
+
+    src = None if (not explicit and target_from_card(reply)) else reply  # a card is only context
+    no_fmt = enums.ParseMode.DISABLED
+    try:
+        if media_file_id(m):  # the command message itself carries a file
+            kind = m.media.name.lower()
+            await client.send_cached_media(uid, media_file_id(m), caption=rest, parse_mode=no_fmt)
+        elif rest and src and media_file_id(src):  # replied file + new caption
+            kind = src.media.name.lower()
+            await client.send_cached_media(uid, media_file_id(src), caption=rest, parse_mode=no_fmt)
+        elif rest:
+            kind = "text"
+            await client.send_message(uid, rest, parse_mode=no_fmt, link_preview_options=NO_PREVIEW)
+        elif src:  # copy the replied message as it is (text, file, photo, ...)
+            kind = src.media.name.lower() if src.media else "text"
+            await src.copy(uid)
+        else:
+            return await m.reply(SENT_USAGE, quote=True)
+    except (UserIsBlocked, InputUserDeactivated):
+        return await m.reply(f"✗ <code>{uid}</code> has blocked the bot or deleted the account.", quote=True)
+    except PeerIdInvalid:
+        return await m.reply(
+            f"✗ The bot doesn't know <code>{uid}</code>. The user must press /start in the bot first.",
+            quote=True,
+        )
+    except FloodWait as e:
+        return await m.reply(f"▲ Telegram says wait {e.value}s, try again.", quote=True)
+    except Exception as e:
+        return await m.reply(f"✗ <b>Failed</b>\n{esc(e)}", quote=True)
+
+    await m.reply(f"✓ <b>Sent</b> ({kind}) → <code>{uid}</code>", quote=True)
+    if AUTO_GROUP and m.chat.id != AUTO_GROUP:  # keep a record in the group when used in the bot chat
+        group_text(
+            AUTO_GROUP,
+            "✉ <b>Reply Sent To User</b>\n"
+            + LINE
+            + f"\n¤ ID: <code>{uid}</code>\n"
+            f"◇ Type: {kind}\n"
+            f"♛ By: {m.from_user.mention}\n"
+            f"◇ Time: {now_ist()}",
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -1349,7 +1565,7 @@ NOT_FOUND_TEXT = (
     & ~filters.command(
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
-            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset",
+            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent",
         ]
     )
 )
@@ -1371,6 +1587,7 @@ async def search_handler(client: Client, m: Message):
     text, kb = await build_page(query, 0, token)
 
     if not text:
+        log_movie_request(m.from_user, query)
         rows = []
         if SUPPORT_USERNAME:
             rows.append([btn("♡ Support", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
@@ -1515,6 +1732,7 @@ async def get_cb(client: Client, cq: CallbackQuery):
             return await cq.answer("Couldn't get the file, please try again later.", show_alert=True)
 
     await cq.answer("□ File sent ✓")
+    log_file_sent(cq.from_user, title, (row or {}).get("size", 0))
     schedule_delete(sent)
 
 
@@ -1567,6 +1785,7 @@ async def set_menu_commands():
         BotCommand("setstart", "Set start image"),
         BotCommand("delstart", "Remove start image"),
         BotCommand("admins", "List admins"),
+        BotCommand("sent", "Send a message/file to a user"),
     ]
     owner_cmds = admin_cmds + [
         BotCommand("addadmin", "Add an admin"),
@@ -1587,7 +1806,7 @@ async def set_menu_commands():
 
 
 async def main():
-    global BOT_USERNAME, DB_CHANNEL
+    global BOT_USERNAME, DB_CHANNEL, _log_queue
     await store.init()
     if hasattr(store, "notify"):
         store.notify = notify_admins  # tells admins when a MongoDB gets full
@@ -1598,9 +1817,13 @@ async def main():
     _known_users.update(await store.all_user_ids())
     await app.start()
     BOT_USERNAME = (await app.get_me()).username or ""
+    _log_queue = asyncio.Queue(maxsize=2000)
+    worker = asyncio.create_task(_log_worker())
+    _tasks.add(worker)
     log.info("Bot started: @%s", BOT_USERNAME)
     log.info("Admins: %s", sorted(ALL_ADMINS))
     log.info("DB channel: %s", DB_CHANNEL)
+    log.info("Log group: %s | Auto-reply group: %s", LOG_GROUP or "none", AUTO_GROUP or "none")
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
