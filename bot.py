@@ -1652,6 +1652,48 @@ def cache_query(token: str, query: str):
         _filter_cache.pop(old, None)
 
 
+_EXT_RE = re.compile(
+    r"\.(mkv|mp4|avi|mov|webm|m4v|ts|flv|wmv|mp3|m4a|ogg|wav|flac|pdf|epub|mobi|azw3|zip|rar|7z|srt|txt|doc|docx)$",
+    re.I,
+)
+_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/)[^\s\]\)\}\[\(\{<>\"']+", re.I)
+_DOMAIN_RE = re.compile(
+    r"(?<![\w@/])([A-Za-z0-9-]{4,})\.(?:com|net|org|in|me|xyz|info|io|cc|tv|app|site|online|club|vip|live|link|"
+    r"top|biz|ws|pw|fun|cam|lol|nl|ink|wiki|click|lat|space|store|tech|cyou|monster|ltd)\b(?:/\S*)?",
+    re.I,
+)
+_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,})")
+_NOT_A_SITE = {
+    "hindi", "dual", "audio", "webrip", "web-dl", "bluray", "brrip", "hdrip", "hdtv", "x264", "x265", "hevc",
+    "esub", "english", "tamil", "telugu", "malayalam", "kannada", "bengali", "punjabi", "1080p", "720p",
+    "480p", "2160p", "4k", "season", "complete", "movie", "movies",
+}
+
+
+def _domain_sub(m):
+    return m.group(0) if m.group(1).lower() in _NOT_A_SITE else " "
+
+
+def _mention_sub(m):
+    return m.group(0) if BOT_USERNAME and m.group(1).lower() == BOT_USERNAME.lower() else " "
+
+
+def clean_title(title: str) -> str:
+    """File name without links / site names / other @usernames (only the bot's own @username stays)."""
+    title = title or ""
+    ext_m = _EXT_RE.search(title)
+    ext = ext_m.group(0) if ext_m else ""
+    base = title[: ext_m.start()] if ext_m else title
+    base = _URL_RE.sub(" ", base)
+    base = _DOMAIN_RE.sub(_domain_sub, base)
+    base = _MENTION_RE.sub(_mention_sub, base)
+    base = re.sub(r"\[\s*[-_|.]*\s*\]|\(\s*[-_|.]*\s*\)|\{\s*[-_|.]*\s*\}", " ", base)
+    base = re.sub(r"\s{2,}", " ", base)
+    base = re.sub(r"(?:\s[-_|•·~+:,]){2,}", " -", base)
+    base = base.strip(" -_|•·:~+,.")
+    return (base or "File") + ext
+
+
 def file_meta(title: str, extra: str = ""):
     """(quality, [language codes], [seasons]) read from the file name (+ caption/search text)."""
     text = f"{title or ''} {extra or ''}"
@@ -1790,7 +1832,7 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_clear')}", callback_data=f"f|x|all|{token}")])
 
     for mid, title, size, *_ in chunk:
-        label = f"{file_icon(title)} {human(size)} ┃ {title[:38]}"
+        label = f"{file_icon(title)} {human(size)} ┃ {clean_title(title)[:38]}"
         if group_links and BOT_USERNAME:
             # in a group the file is NOT sent: the button opens the bot, which sends the file in private
             rows.append([InlineKeyboardButton(label, url=f"https://t.me/{BOT_USERNAME}?start=f{mid}")])
@@ -2015,11 +2057,18 @@ async def page_cb(client: Client, cq: CallbackQuery):
 
 
 def file_caption(title: str, size: int, lang: str = "en") -> str:
+    q, langs, seasons = file_meta(title)
     text = (
-        f"{file_icon(title)} <b>{esc(title[:200])}</b>\n"
+        f"{file_icon(title)} <b>{esc(clean_title(title)[:200])}</b>\n"
         + LINE
         + f"\n□ {tr(lang, 'size')}: <b>{human(size)}</b>\n"
     )
+    if q:
+        text += f"◇ Quality: <b>{esc(q)}</b>\n"
+    if langs:
+        text += "◇ Language: <b>" + esc(", ".join(LANG_NAMES.get(x, x) for x in langs)) + "</b>\n"
+    if seasons:
+        text += "◇ Season: <b>" + ", ".join(f"S{int(x):02d}" for x in sorted(seasons)) + "</b>\n"
     if AUTO_DELETE_SECONDS > 0:
         text += f"◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
     text += LINE + f"\n✓ <i>{tr(lang, 'save_now')}</i>"
