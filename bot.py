@@ -898,31 +898,56 @@ async def mirror_handler(client: Client, m: Message):
 # USER COMMANDS
 # ----------------------------------------------------------------------------
 async def open_home(client: Client, chat_id: int, user):
-    """After the language is known: force-join screen or the welcome message."""
+    """Language -> Force Join -> Pending File / Welcome."""
+
+    # STEP 1: Language selection
+    if not await has_chosen_lang(user.id):
+        return await client.send_message(
+            chat_id,
+            lang_pick_text(),
+            reply_markup=lang_keyboard(),
+            link_preview_options=NO_PREVIEW,
+        )
+
+    # STEP 2: Force Join check
     lang = await lang_of(user)
     missing = await not_joined(client, user.id)
+
     if missing:
         text, kb = await join_view(missing, lang)
-        return await client.send_message(chat_id, text, reply_markup=kb, link_preview_options=NO_PREVIEW)
+        return await client.send_message(
+            chat_id,
+            text,
+            reply_markup=kb,
+            link_preview_options=NO_PREVIEW,
+        )
+
+    # STEP 3: Pending File or Welcome
     if await deliver_pending(client, user, chat_id, lang):
         return
+
     await send_welcome(client, chat_id, user, lang)
 
 
 @app.on_message(filters.command("start") & user_place)
 async def start_cmd(client: Client, m: Message):
-    if m.chat.id > 0:  # private chat only: groups are not saved as bot users / start cards
+
+    if m.chat.id > 0:
         is_new = await register_user(m.from_user.id)
         await log_start(client, m.from_user, is_new)
-        wanted = re.fullmatch(r"f(\d{1,12})", m.command[1]) if len(m.command) > 1 else None
-        if wanted:  # he came from a button of a group: remember the file
+
+        wanted = (
+            re.fullmatch(r"f(\d{1,12})", m.command[1])
+            if len(m.command) > 1 else None
+        )
+
+        if wanted:
             if len(_pending_file) > 5000:
                 _pending_file.clear()
-            _pending_file[m.from_user.id] = int(wanted.group(1))
-    if not await has_chosen_lang(m.from_user.id):  # first time: choose the language
-        return await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
-    await open_home(client, m.chat.id, m.from_user)
 
+            _pending_file[m.from_user.id] = int(wanted.group(1))
+
+    await open_home(client, m.chat.id, m.from_user)
 
 @app.on_message(filters.command("language") & user_place)
 async def language_cmd(_, m: Message):
@@ -937,16 +962,28 @@ async def lang_open_cb(_, cq: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^lg\|"))
 async def lang_cb(client: Client, cq: CallbackQuery):
+
     code = cq.data.split("|", 1)[1]
+
     if code not in LANGS:
         return await cq.answer()
+
     await set_lang(cq.from_user.id, code)
-    await cq.answer(tr(code, "lang_set", lang=LANGS[code][0]))
+
+    await cq.answer(
+        tr(code, "lang_set", lang=LANGS[code][0])
+    )
+
     try:
         await cq.message.delete()
     except Exception:
         pass
-    await open_home(client, cq.message.chat.id, cq.from_user)
+
+    await open_home(
+        client,
+        cq.message.chat.id,
+        cq.from_user,
+    )
 
 
 @app.on_message(filters.command("help") & user_place)
@@ -1866,22 +1903,32 @@ if GROUP_TEXT_SEARCH:
 # ----------------------------------------------------------------------------
 @app.on_callback_query(filters.regex(r"^recheck$"))
 async def recheck_cb(client: Client, cq: CallbackQuery):
+
     lang = await lang_of(cq.from_user)
     missing = await not_joined(client, cq.from_user.id)
+
     if missing:
-        await cq.answer(tr(lang, "a_notjoined"), show_alert=True)
+        await cq.answer(
+            tr(lang, "a_notjoined"),
+            show_alert=True,
+        )
+
         text, kb = await join_view(missing, lang)
         await edit(cq.message, text, kb)
         return
-    await cq.answer("☆ " + tr(lang, "a_thanks"))
-    if await deliver_pending(client, cq.from_user, cq.message.chat.id, lang):
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
-        return
-    await show_home(client, cq, lang)
 
+    await cq.answer("☆ " + tr(lang, "a_thanks"))
+
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+
+    await open_home(
+        client,
+        cq.message.chat.id,
+        cq.from_user,
+    )
 
 async def show_home(client: Client, cq: CallbackQuery, lang: str):
     """Welcome screen. If the start picture is set and the message is plain text (after Help), the
