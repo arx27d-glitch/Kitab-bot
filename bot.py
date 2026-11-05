@@ -247,8 +247,8 @@ def ulang(user) -> str:
 
 
 LANG_PROMPT = (
-    "🌐 <b>Choose your language</b>\n"
-    "<b>अपनी भाषा चुनें</b> · <b>اختر لغتك</b> · <b>Выберите язык</b> · <b>Elige tu idioma</b>"
+    "◇ <b>Choose your language</b>\n"
+    "◇ <b>अपनी भाषा चुनें</b>\n ◇ <b>اختر لغتك</b>\n ◇ <b>Выберите язык</b>\n ◇ <b>Elige tu idioma</b>"
 )
 
 
