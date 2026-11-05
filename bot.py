@@ -1444,7 +1444,7 @@ async def del_cmd(_, m: Message):
                 f"✗ {human(size)} ┃ {title[:38]}", callback_data=f"dl|{mid}"
             )
         ]
-        for mid, title, size in shown
+        for mid, title, size, *_ in shown
     ]
     rows.append([InlineKeyboardButton("« Cancel", callback_data="dln")])
     more = f"\n▲ Showing 10 of {len(results)}. Use a more specific name." if len(results) > 10 else ""
@@ -1615,6 +1615,28 @@ def cache_query(token: str, query: str):
         _filter_cache.pop(old, None)
 
 
+def file_meta(title: str, extra: str = ""):
+    """(quality, [language codes], [seasons]) read from the file name (+ caption/search text)."""
+    text = f"{title or ''} {extra or ''}"
+    return detect_quality(text), detect_languages(text), detect_seasons(text)
+
+
+def phonetic_rank(words, candidates):
+    """Keeps files whose name sounds like the query (salam = salaam = सलाम), best match first."""
+    keys = phonetic_words(" ".join(words))
+    if not keys:
+        return []
+    need = len(keys) if len(keys) <= 3 else math.ceil(len(keys) * 0.7)
+    scored = []
+    for row in candidates:
+        have = set(phonetic_words(f"{row[1]} {row[3] if len(row) > 3 else ''}"))
+        hits = sum(1 for k in keys if k in have)
+        if hits >= need:
+            scored.append((-hits, (row[1] or "").lower(), row))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [r for _, _, r in scored]
+
+
 async def run_search(query: str):
     """(results, fuzzy). Understands other scripts (Hindi, Tamil...) and different spellings."""
     words = norm(query).split()
@@ -1650,7 +1672,7 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         return None, None
 
     # quality / language / season are read from the file names
-    metas = [(r, file_meta(r[1])) for r in all_results]
+    metas = [(r, file_meta(r[1], r[3] if len(r) > 3 else "")) for r in all_results]
     sel = _filter_cache.setdefault(token, {})
 
     def ok(meta, skip=""):
@@ -1730,7 +1752,7 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
     if active_parts:
         rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_clear')}", callback_data=f"f|x|all|{token}")])
 
-    for mid, title, size in chunk:
+    for mid, title, size, *_ in chunk:
         label = f"{file_icon(title)} {human(size)} ┃ {title[:38]}"
         if group_links and BOT_USERNAME:
             # in a group the file is NOT sent: the button opens the bot, which sends the file in private
