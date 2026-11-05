@@ -29,7 +29,7 @@ from pyrogram.types import (
 )
 
 from i18n import LANGS, detect_lang, tr
-from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER
+from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, detect_languages, detect_quality, detect_seasons
 from translit import phonetic_rank, to_latin
 from storage import MongoStore, MultiMongoStore, SqliteStore
 
