@@ -28,7 +28,9 @@ from pyrogram.types import (
     Message,
 )
 
+from i18n import LANGS, detect_lang, tr
 from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
+from translit import phonetic_rank, to_latin
 from storage import MongoStore, MultiMongoStore, SqliteStore
 
 load_dotenv()
@@ -450,46 +452,94 @@ async def edit(msg: Message, text: str, kb=None):
 
 
 # ----------------------------------------------------------------------------
+# LANGUAGE: every user has his own language (chosen on /start, changeable with /language)
+# ----------------------------------------------------------------------------
+_user_lang: dict = {}
+
+
+async def lang_of(user) -> str:
+    """Language of a user: his choice -> his Telegram language -> English."""
+    lg = _user_lang.get(user.id)
+    if lg:
+        return lg
+    saved = await store.get_meta(f"lang:{user.id}", "")
+    lg = saved if saved in LANGS else detect_lang(getattr(user, "language_code", None))
+    if len(_user_lang) > 5000:
+        _user_lang.clear()
+    _user_lang[user.id] = lg
+    return lg
+
+
+async def has_chosen_lang(user_id: int) -> bool:
+    return (await store.get_meta(f"lang:{user_id}", "")) in LANGS
+
+
+async def set_lang(user_id: int, code: str):
+    await store.set_meta(f"lang:{user_id}", code)
+    _user_lang[user_id] = code
+
+
+def lang_pick_text() -> str:
+    return (
+        "◇ <b>Choose your language</b>\n"
+        f"◇ <b>{tr('hi', 'lang_title')}</b>\n"
+        f"◇ <b>{tr('ar', 'lang_title')}</b>\n"
+        f"◇ <b>{tr('ru', 'lang_title')}</b>"
+    )
+
+
+def lang_keyboard():
+    items = list(LANGS.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(f"{flag} {name}", callback_data=f"lg|{code}")
+                for code, (name, flag) in items[i:i + 2]
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+# ----------------------------------------------------------------------------
 # UI: texts + buttons
 # ----------------------------------------------------------------------------
-def welcome_text(user) -> str:
-    if START_TEXT_ENV:
-        body = START_TEXT_ENV
-    else:
-        body = (
-            "◇ <b>{bot_name}</b> ◇\n"
-            + LINE
-            + "\n♡ Hello {mention}!\n\n"
-            "☆ Send me the <b>name</b> of any Movie or Series and I'll find the file and send it instantly.\n\n"
-            "┏ ¤ <b>Fast Search</b>\n"
-            "┣ □ <b>Instant Delivery</b>\n"
-            "┗ ◇ <b>Auto-delete</b>: {minutes} min\n"
-            + LINE
-            + "\n♤ <i>Tip: type a short name, like</i> <code>Coolie </code>"
+def welcome_text(user, lang: str = "en") -> str:
+    if START_TEXT_ENV:  # a custom text from .env is used for every language
+        return START_TEXT_ENV.format(
+            mention=user.mention,
+            first_name=esc(user.first_name),
+            bot_name=esc(BOT_NAME),
+            minutes=minutes(),
         )
-    return body.format(
-        mention=user.mention,
-        first_name=esc(user.first_name),
-        bot_name=esc(BOT_NAME),
-        minutes=minutes(),
+    return (
+        f"◇ <b>{esc(BOT_NAME)}</b> ◇\n"
+        + LINE
+        + f"\n♡ {tr(lang, 'hello', mention=user.mention)}\n\n"
+        f"☆ {tr(lang, 'send_name')}\n\n"
+        f"┏ ¤ <b>{tr(lang, 'f_search')}</b>\n"
+        f"┣ □ <b>{tr(lang, 'f_delivery')}</b>\n"
+        f"┗ ◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
+        + LINE
+        + f"\n♤ <i>{tr(lang, 'tip')}</i> <code>Coolie </code>"
     )
 
 
-def help_text(is_admin: bool, is_owner: bool = False) -> str:
+def help_text(is_admin: bool, is_owner: bool = False, lang: str = "en") -> str:
     text = (
-        "☆ <b>How To Use</b>\n"
+        f"☆ <b>{tr(lang, 'how_title')}</b>\n"
         + LINE
-        + "\n1. Send the <b>name</b> of a movie\n"
-        "2. Pick your <b>file</b> from the result list\n"
-        f"3. Once you get the file, <b>save or forward</b> it (it gets deleted in {minutes()} min)\n"
+        + f"\n1. {tr(lang, 'step1')}\n"
+        f"2. {tr(lang, 'step2')}\n"
+        f"3. {tr(lang, 'step3', minutes=minutes())}\n"
         + LINE
-        + "\n♤ <b>Tips</b>\n"
-        "• Use a short and simple name\n"
-        "• Use the quality / language / season buttons to filter the files\n"
-        "• Double-check the spelling\n"
-        "• Movie/Series name only, like <code>KGF </code>"
+        + f"\n♤ <b>{tr(lang, 'tips_title')}</b>\n"
+        f"• {tr(lang, 'tip1')}\n"
+        f"• {tr(lang, 'tip2')}\n"
+        f"• {tr(lang, 'tip3')}\n"
+        f"• {tr(lang, 'tip4')} <code>KGF </code>"
     )
-    if is_admin:
+    if is_admin:  # admin / owner commands stay in English
         text += (
             "\n\n♛ <b>Admin Commands</b>\n"
             + LINE
@@ -516,69 +566,70 @@ def help_text(is_admin: bool, is_owner: bool = False) -> str:
     return text
 
 
-async def about_text() -> str:
+async def about_text(lang: str = "en") -> str:
     files = await store.count_files()
     users = await store.count_users()
     text = (
-        f"¤ <b>About {esc(BOT_NAME)}</b>\n"
+        f"¤ <b>{esc(BOT_NAME)}</b> ┃ {tr(lang, 'about_title')}\n"
         + LINE
-        + f"\n☆ Files: <b>{files}</b>\n"
-        f"♧ Users: <b>{users}</b>\n"
-        f"◇ Auto-delete: <b>{minutes()} min</b>\n"
+        + f"\n☆ {tr(lang, 'files')}: <b>{files}</b>\n"
+        f"♧ {tr(lang, 'users')}: <b>{users}</b>\n"
+        f"◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
     )
     if BOT_USERNAME:
         text += f"♧ Bot: @{BOT_USERNAME}\n"
     if OWNER_USERNAME:
-        text += f"♡ Owner: @{esc(OWNER_USERNAME)}\n"
-    text += LINE + "\n♡ <i>Keep watching, keep growing.</i>"
+        text += f"♡ {tr(lang, 'b_owner')}: @{esc(OWNER_USERNAME)}\n"
+    text += LINE + f"\n♡ <i>{tr(lang, 'motto')}</i>"
     return text
 
 
-def link_buttons():
+def link_buttons(lang: str = "en"):
     row = []
     if UPDATES_CHANNEL:
-        row.append(InlineKeyboardButton("◇ Updates", url=f"https://t.me/{UPDATES_CHANNEL}"))
+        row.append(InlineKeyboardButton(f"◇ {tr(lang, 'b_updates')}", url=f"https://t.me/{UPDATES_CHANNEL}"))
     if SUPPORT_USERNAME:
-        row.append(btn("♡ Support", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}"))
+        row.append(btn(f"♡ {tr(lang, 'b_support')}", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}"))
     return row
 
 
-def home_keyboard():
+def home_keyboard(lang: str = "en"):
     rows = [
         [
-            btn("☆ Help", BLUE, callback_data="help"),
-            btn("¤ About", GREEN, callback_data="about"),
+            btn(f"☆ {tr(lang, 'b_help')}", BLUE, callback_data="help"),
+            btn(f"¤ {tr(lang, 'b_about')}", GREEN, callback_data="about"),
         ]
     ]
-    links = link_buttons()
+    links = link_buttons(lang)
     if links:
         rows.append(links)
     if OWNER_USERNAME:
-        rows.append([btn("♤ Owner", GREEN, url=f"https://t.me/{OWNER_USERNAME}")])
+        rows.append([btn(f"♤ {tr(lang, 'b_owner')}", GREEN, url=f"https://t.me/{OWNER_USERNAME}")])
+    rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_lang')}", callback_data="lang")])
     return InlineKeyboardMarkup(rows)
 
 
-def back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("□ Home", callback_data="home")]])
+def back_keyboard(lang: str = "en"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"□ {tr(lang, 'b_home')}", callback_data="home")]])
 
 
-def file_keyboard():
-    row = link_buttons()
+def file_keyboard(lang: str = "en"):
+    row = link_buttons(lang)
     if OWNER_USERNAME:
-        row.append(btn("♤ Owner", GREEN, url=f"https://t.me/{OWNER_USERNAME}"))
+        row.append(btn(f"♤ {tr(lang, 'b_owner')}", GREEN, url=f"https://t.me/{OWNER_USERNAME}"))
     return InlineKeyboardMarkup([row]) if row else None
 
 
-async def send_welcome(m: Message):
-    text = welcome_text(m.from_user)
-    kb = home_keyboard()
+async def send_welcome(client: Client, chat_id: int, user, lang: str = "en"):
+    text = welcome_text(user, lang)
+    kb = home_keyboard(lang)
     pic = await store.get_meta("start_pic", "") or START_PIC
     if pic:
         try:
-            return await m.reply_photo(pic, caption=text, reply_markup=kb, quote=True)
+            return await client.send_photo(chat_id, pic, caption=text, reply_markup=kb)
         except Exception as e:
             log.warning("Could not send start pic (%s), sending text instead", e)
-    return await m.reply(text, reply_markup=kb, quote=True, link_preview_options=NO_PREVIEW)
+    return await client.send_message(chat_id, text, reply_markup=kb, link_preview_options=NO_PREVIEW)
 
 
 # ----------------------------------------------------------------------------
@@ -610,32 +661,42 @@ async def not_joined(client: Client, user_id: int):
     return missing
 
 
-async def join_view(missing):
+async def join_view(missing, lang: str = "en"):
     """(text, keyboard) - join screen with progress."""
     total = len(await get_force_channels())
     joined = max(total - len(missing), 0)
-    if JOIN_TEXT_ENV:
+    if JOIN_TEXT_ENV:  # a custom text from .env is used for every language
         text = JOIN_TEXT_ENV
     else:
         text = (
-            "□ <b>Access Locked</b>\n"
+            f"□ <b>{tr(lang, 'locked')}</b>\n"
             + LINE
-            + f"\nJoin the <b>{len(missing)}</b> channel(s) below to use this bot.\n\n"
-            f"□ Progress: {progress_bar(joined, total)} <b>{joined}/{total}</b>\n"
+            + f"\n{tr(lang, 'join_msg', n=len(missing))}\n\n"
+            f"□ {tr(lang, 'progress')}: {progress_bar(joined, total)} <b>{joined}/{total}</b>\n"
             + LINE
-            + "\nAfter joining, tap <b>✓ I Have Joined</b>."
+            + f"\n{tr(lang, 'after_join')}"
         )
     rows = []
     for ch in missing:
         if ch["link"]:
-            rows.append([InlineKeyboardButton(f"◇ Join Channel {ch['n']}  ↗", url=ch["link"])])
-    rows.append([InlineKeyboardButton("✓ I Have Joined", callback_data="recheck")])
+            rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_join')} {ch['n']}  ↗", url=ch["link"])])
+    rows.append([InlineKeyboardButton(f"✓ {tr(lang, 'b_joined')}", callback_data="recheck")])
     return text, InlineKeyboardMarkup(rows)
 
 
 # ----------------------------------------------------------------------------
 # INDEXING (file name + file_id are saved in the database)
 # ----------------------------------------------------------------------------
+def search_text(title: str, caption: str) -> str:
+    """Text used for searching: the name + the same name in Latin letters (for Hindi/Tamil... names)."""
+    raw = f"{title} {caption}"
+    text = norm(raw)
+    latin = to_latin(raw)
+    if latin != raw:
+        text += " " + norm(latin)
+    return text
+
+
 async def index_message(m: Message) -> bool:
     media = m.document or m.video or m.audio
     if not media:
@@ -643,7 +704,7 @@ async def index_message(m: Message) -> bool:
     caption = m.caption or ""
     title = getattr(media, "file_name", None) or caption or f"file_{m.id}"
     await store.upsert_file(
-        m.id, title, norm(f"{title} {caption}"), media.file_size or 0, media.file_id, caption
+        m.id, title, search_text(title, caption), media.file_size or 0, media.file_id, caption
     )
     log.info("Indexed: %s", title)
     return True
@@ -758,20 +819,58 @@ async def mirror_handler(client: Client, m: Message):
 # ----------------------------------------------------------------------------
 # USER COMMANDS
 # ----------------------------------------------------------------------------
+async def open_home(client: Client, chat_id: int, user):
+    """After the language is known: force-join screen or the welcome message."""
+    lang = await lang_of(user)
+    missing = await not_joined(client, user.id)
+    if missing:
+        text, kb = await join_view(missing, lang)
+        return await client.send_message(chat_id, text, reply_markup=kb, link_preview_options=NO_PREVIEW)
+    await send_welcome(client, chat_id, user, lang)
+
+
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, m: Message):
     is_new = await register_user(m.from_user.id)
     await log_start(client, m.from_user, is_new)
-    missing = await not_joined(client, m.from_user.id)
-    if missing:
-        text, kb = await join_view(missing)
-        return await m.reply(text, reply_markup=kb, quote=True)
-    await send_welcome(m)
+    if not await has_chosen_lang(m.from_user.id):  # first time: choose the language
+        return await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
+    await open_home(client, m.chat.id, m.from_user)
+
+
+@app.on_message(filters.command("language") & filters.private)
+async def language_cmd(_, m: Message):
+    await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
+
+
+@app.on_callback_query(filters.regex(r"^lang$"))
+async def lang_open_cb(_, cq: CallbackQuery):
+    await edit(cq.message, lang_pick_text(), lang_keyboard())
+    await cq.answer()
+
+
+@app.on_callback_query(filters.regex(r"^lg\|"))
+async def lang_cb(client: Client, cq: CallbackQuery):
+    code = cq.data.split("|", 1)[1]
+    if code not in LANGS:
+        return await cq.answer()
+    await set_lang(cq.from_user.id, code)
+    await cq.answer(tr(code, "lang_set", lang=LANGS[code][0]))
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await open_home(client, cq.message.chat.id, cq.from_user)
 
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_cmd(_, m: Message):
-    await m.reply(help_text(is_admin_id(m.from_user.id), m.from_user.id in ADMINS), reply_markup=back_keyboard(), quote=True)
+    lang = await lang_of(m.from_user)
+    await m.reply(
+        help_text(is_admin_id(m.from_user.id), m.from_user.id in ADMINS, lang),
+        reply_markup=back_keyboard(lang),
+        quote=True,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1431,16 +1530,35 @@ def cache_query(token: str, query: str):
 
 
 async def run_search(query: str):
-    """(results, fuzzy). If there's no exact match, similar results (at least one word) are returned."""
+    """(results, fuzzy). Understands other scripts (Hindi, Tamil...) and different spellings."""
     words = norm(query).split()
     results = await store.find(words)
-    if results or len(words) < 2:
+    if results:
         return results, False
-    useful = [w for w in words if len(w) >= 3] or words
-    return await store.find_any(useful), True
+
+    latin = to_latin(query)  # "मां तुझे सलाम" -> "man tujhe salam"
+    lwords = norm(latin).split() if latin != query else words
+    if lwords and lwords != words:
+        results = await store.find(lwords)
+        if results:
+            return results, False
+
+    if lwords:  # spelling-tolerant: salam = salaam, maan = maa ...
+        prefixes = list({w[:3] for w in lwords if len(w) >= 2})
+        candidates = await store.find_any(prefixes, limit=600) if prefixes else []
+        results = phonetic_rank(lwords, candidates)
+        if results:
+            return results, True
+
+    if len(lwords) >= 2:
+        useful = [w for w in lwords if len(w) >= 3] or lwords
+        results = await store.find_any(useful)
+        if results:
+            return results, True
+    return [], False
 
 
-async def build_page(query: str, page: int, token: str):
+async def build_page(query: str, page: int, token: str, lang: str = "en"):
     all_results, fuzzy = await run_search(query)
     if not all_results:
         return None, None
@@ -1501,10 +1619,10 @@ async def build_page(query: str, page: int, token: str):
     chunk = results[page * RESULTS_PER_PAGE:(page + 1) * RESULTS_PER_PAGE]
 
     text = (
-        "¤ <b>Search Results</b>\n"
+        f"¤ <b>{tr(lang, 'results')}</b>\n"
         + LINE
-        + f"\n□ Query: <i>{esc(query[:60])}</i>\n"
-        f"□ Found: <b>{total}</b>  •  Page <b>{page + 1}/{pages}</b>\n"
+        + f"\n□ {tr(lang, 'query')}: <i>{esc(query[:60])}</i>\n"
+        f"□ {tr(lang, 'found')}: <b>{total}</b>  •  {tr(lang, 'page')} <b>{page + 1}/{pages}</b>\n"
     )
     active_parts = []
     if sel.get("q"):
@@ -1514,17 +1632,17 @@ async def build_page(query: str, page: int, token: str):
     if sel.get("s"):
         active_parts.append(f"S{int(sel['s']):02d}")
     if active_parts:
-        text += f"◇ Filter: <b>{' • '.join(active_parts)}</b>\n"
+        text += f"◇ {tr(lang, 'filter')}: <b>{' • '.join(active_parts)}</b>\n"
     if fuzzy:
-        text += "¤ <i>No exact match found, showing similar results</i>\n"
-    text += LINE + "\n▼ <b>Choose quality / language / season / file</b>"
+        text += f"¤ <i>{tr(lang, 'no_exact')}</i>\n"
+    text += LINE + f"\n▼ <b>{tr(lang, 'choose')}</b>"
 
     rows = []
     rows += facet_rows("q", q_opts, lambda v: v, 3)
     rows += facet_rows("l", l_opts, lambda v: LANG_NAMES[v], 3)
     rows += facet_rows("s", s_opts, lambda v: f"S{v:02d}", 4)
     if active_parts:
-        rows.append([InlineKeyboardButton("◇ Clear Filters", callback_data=f"f|x|all|{token}")])
+        rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_clear')}", callback_data=f"f|x|all|{token}")])
 
     rows += [
         [
@@ -1538,25 +1656,26 @@ async def build_page(query: str, page: int, token: str):
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("« Prev", callback_data=f"pg|{page - 1}|{token}"))
+            nav.append(InlineKeyboardButton("«", callback_data=f"pg|{page - 1}|{token}"))
         nav.append(InlineKeyboardButton(f"□ {page + 1}/{pages}", callback_data="noop"))
         if page < pages - 1:
-            nav.append(InlineKeyboardButton("Next »", callback_data=f"pg|{page + 1}|{token}"))
+            nav.append(InlineKeyboardButton("»", callback_data=f"pg|{page + 1}|{token}"))
         rows.append(nav)
-    rows.append([btn("× Close ×", RED, callback_data="close")])
+    rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
     return text, InlineKeyboardMarkup(rows)
 
 
-NOT_FOUND_TEXT = (
-    "¤ <b>Nothing Found</b>\n"
-    + LINE
-    + "\n¤ <i>{query}</i>\n\n"
-    "♤ <b>Try this:</b>\n"
-    "• Check the spelling\n"
-    "• Use a shorter name (just the main word)\n"
-    "• Try both Hindi and English\n"
-    + LINE
-)
+def not_found_text(query: str, lang: str = "en") -> str:
+    return (
+        f"¤ <b>{tr(lang, 'nf_title')}</b>\n"
+        + LINE
+        + f"\n¤ <i>{esc(query[:60])}</i>\n\n"
+        f"♤ <b>{tr(lang, 'nf_try')}:</b>\n"
+        f"• {tr(lang, 'nf1')}\n"
+        f"• {tr(lang, 'nf2')}\n"
+        f"• {tr(lang, 'nf3')}\n"
+        + LINE
+    )
 
 
 @app.on_message(
@@ -1565,15 +1684,16 @@ NOT_FOUND_TEXT = (
     & ~filters.command(
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
-            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent",
+            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language",
         ]
     )
 )
 async def search_handler(client: Client, m: Message):
     await register_user(m.from_user.id)
+    lang = await lang_of(m.from_user)
     missing = await not_joined(client, m.from_user.id)
     if missing:
-        text, kb = await join_view(missing)
+        text, kb = await join_view(missing, lang)
         return await m.reply(text, reply_markup=kb, quote=True)
 
     try:
@@ -1584,16 +1704,16 @@ async def search_handler(client: Client, m: Message):
     query = m.text[:100]
     token = f"{m.from_user.id}{m.id}"
     cache_query(token, query)
-    text, kb = await build_page(query, 0, token)
+    text, kb = await build_page(query, 0, token, lang)
 
     if not text:
         log_movie_request(m.from_user, query)
         rows = []
         if SUPPORT_USERNAME:
-            rows.append([btn("♡ Support", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
-        rows.append([btn("× Close ×", RED, callback_data="close")])
+            rows.append([btn(f"♡ {tr(lang, 'b_support')}", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
+        rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
         reply = await m.reply(
-            NOT_FOUND_TEXT.format(query=esc(query[:60])),
+            not_found_text(query, lang),
             reply_markup=InlineKeyboardMarkup(rows),
             quote=True,
         )
@@ -1609,31 +1729,39 @@ async def search_handler(client: Client, m: Message):
 # ----------------------------------------------------------------------------
 @app.on_callback_query(filters.regex(r"^recheck$"))
 async def recheck_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
     missing = await not_joined(client, cq.from_user.id)
     if missing:
-        await cq.answer("You haven't joined all the channels yet!", show_alert=True)
-        text, kb = await join_view(missing)
+        await cq.answer(tr(lang, "a_notjoined"), show_alert=True)
+        text, kb = await join_view(missing, lang)
         await edit(cq.message, text, kb)
         return
-    await cq.answer("☆ Thank you! Now send the name of a Movie/Series.")
-    await edit(cq.message, welcome_text(cq.from_user), home_keyboard())
+    await cq.answer("☆ " + tr(lang, "a_thanks"))
+    await edit(cq.message, welcome_text(cq.from_user, lang), home_keyboard(lang))
 
 
 @app.on_callback_query(filters.regex(r"^home$"))
 async def home_cb(_, cq: CallbackQuery):
-    await edit(cq.message, welcome_text(cq.from_user), home_keyboard())
+    lang = await lang_of(cq.from_user)
+    await edit(cq.message, welcome_text(cq.from_user, lang), home_keyboard(lang))
     await cq.answer()
 
 
 @app.on_callback_query(filters.regex(r"^help$"))
 async def help_cb(_, cq: CallbackQuery):
-    await edit(cq.message, help_text(is_admin_id(cq.from_user.id), cq.from_user.id in ADMINS), back_keyboard())
+    lang = await lang_of(cq.from_user)
+    await edit(
+        cq.message,
+        help_text(is_admin_id(cq.from_user.id), cq.from_user.id in ADMINS, lang),
+        back_keyboard(lang),
+    )
     await cq.answer()
 
 
 @app.on_callback_query(filters.regex(r"^about$"))
 async def about_cb(_, cq: CallbackQuery):
-    await edit(cq.message, await about_text(), back_keyboard())
+    lang = await lang_of(cq.from_user)
+    await edit(cq.message, await about_text(lang), back_keyboard(lang))
     await cq.answer()
 
 
@@ -1647,7 +1775,7 @@ async def close_cb(_, cq: CallbackQuery):
     try:
         await cq.message.delete()
     except Exception:
-        await cq.answer("Couldn't close this.", show_alert=True)
+        await cq.answer(tr(await lang_of(cq.from_user), "a_closefail"), show_alert=True)
         return
     await cq.answer()
 
@@ -1657,7 +1785,7 @@ async def filter_cb(client: Client, cq: CallbackQuery):
     _, kind, value, token = cq.data.split("|", 3)
     query = _search_cache.get(token)
     if not query:
-        return await cq.answer("This search has expired, please send the name again.", show_alert=True)
+        return await cq.answer(tr(await lang_of(cq.from_user), "a_expired"), show_alert=True)
     sel = _filter_cache.setdefault(token, {})
     if kind == "x":
         sel.clear()
@@ -1665,7 +1793,7 @@ async def filter_cb(client: Client, cq: CallbackQuery):
         sel.pop(kind)  # pressing the selected button again clears it
     else:
         sel[kind] = value
-    text, kb = await build_page(query, 0, token)
+    text, kb = await build_page(query, 0, token, await lang_of(cq.from_user))
     if text:
         await edit(cq.message, text, kb)
     await cq.answer()
@@ -1676,22 +1804,22 @@ async def page_cb(client: Client, cq: CallbackQuery):
     _, page, token = cq.data.split("|", 2)
     query = _search_cache.get(token)
     if not query:
-        return await cq.answer("This search has expired, please send the name again.", show_alert=True)
-    text, kb = await build_page(query, int(page), token)
+        return await cq.answer(tr(await lang_of(cq.from_user), "a_expired"), show_alert=True)
+    text, kb = await build_page(query, int(page), token, await lang_of(cq.from_user))
     if text:
         await edit(cq.message, text, kb)
     await cq.answer()
 
 
-def file_caption(title: str, size: int) -> str:
+def file_caption(title: str, size: int, lang: str = "en") -> str:
     text = (
         f"{file_icon(title)} <b>{esc(title[:200])}</b>\n"
         + LINE
-        + f"\n□ Size: <b>{human(size)}</b>\n"
+        + f"\n□ {tr(lang, 'size')}: <b>{human(size)}</b>\n"
     )
     if AUTO_DELETE_SECONDS > 0:
-        text += f"◇ Auto-delete: <b>{minutes()} min</b>\n"
-    text += LINE + "\n✓ <i>Save or forward it now</i>"
+        text += f"◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
+    text += LINE + f"\n✓ <i>{tr(lang, 'save_now')}</i>"
     if BOT_USERNAME:
         text += f"\n♧ @{BOT_USERNAME}"
     return text[:1024]
@@ -1699,17 +1827,18 @@ def file_caption(title: str, size: int) -> str:
 
 @app.on_callback_query(filters.regex(r"^get\|"))
 async def get_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
     missing = await not_joined(client, cq.from_user.id)
     if missing:
-        await cq.answer("Please join all the channels first!", show_alert=True)
-        text, kb = await join_view(missing)
+        await cq.answer(tr(lang, "a_joinfirst"), show_alert=True)
+        text, kb = await join_view(missing, lang)
         return await client.send_message(cq.from_user.id, text, reply_markup=kb)
 
     msg_id = int(cq.data.split("|")[1])
     row = await store.get_file(msg_id)
     title = (row or {}).get("title") or f"file_{msg_id}"
-    caption = file_caption(title, (row or {}).get("size", 0))
-    kb = file_keyboard()
+    caption = file_caption(title, (row or {}).get("size", 0), lang)
+    kb = file_keyboard(lang)
     sent = None
 
     # 1) Send using the file_id saved in the database (works even after a restart)
@@ -1729,9 +1858,9 @@ async def get_cb(client: Client, cq: CallbackQuery):
             )
         except Exception as e:
             log.error("Error while sending file: %s", e)
-            return await cq.answer("Couldn't get the file, please try again later.", show_alert=True)
+            return await cq.answer(tr(lang, "a_filefail"), show_alert=True)
 
-    await cq.answer("□ File sent ✓")
+    await cq.answer(f"□ {tr(lang, 'a_filesent')} ✓")
     log_file_sent(cq.from_user, title, (row or {}).get("size", 0))
     schedule_delete(sent)
 
@@ -1774,6 +1903,7 @@ async def set_menu_commands():
     user_cmds = [
         BotCommand("start", "Start the bot"),
         BotCommand("help", "How to use"),
+        BotCommand("language", "Change language"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("stats", "Bot statistics"),
