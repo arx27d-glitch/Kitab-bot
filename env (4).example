@@ -1,0 +1,84 @@
+# ===== Telegram API (https://my.telegram.org se) =====
+API_ID=1234567
+API_HASH=your_api_hash_here
+
+# ===== Bot token (@BotFather se) =====
+BOT_TOKEN=123456:ABC-your-bot-token
+
+# ===== Files wala private channel (bot ko is channel me ADMIN banao) =====
+# Channel id -100 se shuru hota hai. Baad me owner /dbset se badal sakta hai.
+DB_CHANNEL=-1001234567890
+
+# ===== MongoDB (1 se 10 tak, jitne chahiye utne daalo) =====
+# Sirf 1 hai to MONGO_URI ya MONGO_URI_1 me daalo. Zyada ho to _2, _3 ... _10 me daalo.
+# Jab ek DB bhar jayega, files apne aap agle DB me jayengi (admins ko message aata hai).
+# Beech me koi number chhoot jaye (jaise _3 khali) to koi dikkat nahi.
+MONGO_URI=mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/
+# MONGO_URI_2=mongodb+srv://user:pass@cluster1.xxxxx.mongodb.net/
+# MONGO_URI_3=mongodb+srv://user:pass@cluster2.xxxxx.mongodb.net/
+# MONGO_URI_4=...
+# MONGO_URI_5=...
+# MONGO_URI_6=...
+# MONGO_URI_7=...
+# MONGO_URI_8=...
+# MONGO_URI_9=...
+# MONGO_URI_10=...
+MONGO_DB_NAME=bookbot
+# Is size (MB) par DB "full" maana jayega. Free Atlas = 512 MB, isliye 450 theek hai
+# (baaki jagah users/settings ke liye bachti hai)
+MONGO_LIMIT_MB=450
+
+# ===== Auto-forward: in group(s) ke naye messages DB_CHANNEL me apne aap copy honge =====
+# Group id -100 se shuru hota hai. Ek se zyada ho to space se alag karo.
+# Bot ko group me add karo (admin banao ya BotFather me /setprivacy -> Disable karo).
+SOURCE_GROUPS=-1001111111111 -1002222222222
+# true karoge to files ke saath text messages bhi forward honge (default: sirf files)
+FORWARD_ALL=false
+
+# ===== Jab koi /start kare to is group me notification jayegi =====
+# Khali chhodo to SOURCE_GROUPS ka pehla group use hoga. Bot ko group me add karo.
+LOG_GROUP=-1003333333333
+
+# ===== Auto-reply group =====
+# Isme: user ka har message mirror hota hai, "movie available nahi hai" request cards aate hain,
+# "file is sent to this user" cards aate hain, aur admin yahin se /sent se user ko reply de sakta hai.
+# Khali chhodo to LOG_GROUP wala hi group use hoga. Bot ko group me add karo.
+# AUTO_REPLY_GROUP=-1004444444444
+# true = admins/owners ke messages bhi mirror honge (apne account se test karte waqt true rakho)
+MIRROR_ADMIN_MESSAGES=false
+
+# ===== Owner user ids (space se alag karo) =====
+# Ye owners hain: /addadmin, /deladmin, /del, /dbset sirf inhi ke liye
+ADMINS=123456789 987654321
+
+# ===== Force-Join Channels (10 tak) =====
+# Public channel: @username likho. Private channel: numeric id likho + _LINK me invite link.
+# Bot ko in sabhi channels me ADMIN banana zaroori hai, warna join check nahi hoga.
+CHANNEL_1=@channel_one
+CHANNEL_2=@channel_two
+CHANNEL_3=@channel_three
+CHANNEL_4=@channel_four
+# Private channel ho to ye bhi bharo (warna khali chhod do):
+# CHANNEL_4=-1009876543210
+# CHANNEL_4_LINK=https://t.me/+AbCdEfGhIjK
+
+# ===== Auto delete (seconds me). 300 = 5 minute, 0 = band =====
+AUTO_DELETE_SECONDS=300
+
+# ===== Buttons / names (sab optional) =====
+BOT_NAME=Movie Hub Bot
+OWNER_USERNAME=your_username
+SUPPORT_USERNAME=your_support_group_or_username
+UPDATES_CHANNEL=your_updates_channel
+# Default start image (admin /setstart se badal sakta hai)
+# START_PIC=
+
+# ===== Optional text change (\n se nayi line) =====
+# DHYAN: bot ab 21 languages me khud message bhejta hai. START_TEXT / JOIN_TEXT dene par wo
+# SAARI languages ke liye yahi ek text ban jata hai. Isliye inhe khali (comment) rehne do.
+# START_TEXT=Namaste {mention}!\nMovie ka naam bhejo.
+# JOIN_TEXT=Pehle saare channels join karo.
+
+# ===== Optional =====
+RESULTS_PER_PAGE=8
+DB_PATH=files.db
