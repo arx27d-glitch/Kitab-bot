@@ -31,7 +31,7 @@ from pyrogram.types import (
 from i18n import LANGS, detect_lang, tr
 from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, detect_languages, detect_quality, detect_seasons
 from translit import phonetic_key, phonetic_words, to_latin
-from storage import MongoStore, SqliteStore
+from storage import MongoStore, MultiMongoStore, SqliteStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
