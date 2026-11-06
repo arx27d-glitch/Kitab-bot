@@ -12,6 +12,11 @@ from typing import List, Optional, Tuple
 log = logging.getLogger("bookbot.storage")
 
 
+def _like(word: str) -> str:
+    """LIKE pattern for a word; % and _ typed by a user are NOT wildcards."""
+    return "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 class SqliteStore:
     persistent = False
 
@@ -62,18 +67,18 @@ class SqliteStore:
             return []
         sql = (
             "SELECT msg_id, title, size FROM files WHERE "
-            + " AND ".join(["search LIKE ?"] * len(words))
-            + " ORDER BY title"
+            + " AND ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
+            + " ORDER BY title LIMIT 2000"
         )
-        return [tuple(r) for r in self.db.execute(sql, [f"%{w}%" for w in words]).fetchall()]
+        return [tuple(r) for r in self.db.execute(sql, [_like(w) for w in words]).fetchall()]
 
     async def find_any(self, words: List[str], limit: int = 200) -> List[Tuple[int, str, int]]:
         """Kam se kam ek word match kare; jyada words match wale pehle."""
         if not words:
             return []
-        like = [f"%{w}%" for w in words]
-        score = " + ".join(["(search LIKE ?)"] * len(words))
-        where = " OR ".join(["search LIKE ?"] * len(words))
+        like = [_like(w) for w in words]
+        score = " + ".join(["(search LIKE ? ESCAPE '\\')"] * len(words))
+        where = " OR ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
         sql = (
             f"SELECT msg_id, title, size FROM files WHERE {where} "
             f"ORDER BY ({score}) DESC, title LIMIT {int(limit)}"
