@@ -728,6 +728,34 @@ _START_BOT = {
 for _code, _text in _START_BOT.items():
     T[_code]["a_startbot"] = _text
 
+
+# text of /start in a group where the bot is not admin
+_NEED_ADMIN = {
+    "en": "Make me an admin of this group so I can work here.",
+    "hi": "मुझे इस ग्रुप का एडमिन बनाइए, तभी मैं यहाँ काम कर पाऊँगा।",
+    "fa": "مرا ادمین این گروه کن تا بتوانم اینجا کار کنم.",
+    "uz": "Meni shu guruhga admin qiling, shunda bu yerda ishlay olaman.",
+    "ru": "Сделайте меня администратором этой группы, чтобы я мог здесь работать.",
+    "es": "Hazme administrador de este grupo para que pueda funcionar aquí.",
+    "ar": "اجعلني مشرفاً في هذه المجموعة حتى أتمكن من العمل هنا.",
+    "tr": "Burada çalışabilmem için beni bu grubun yöneticisi yap.",
+    "vi": "Hãy đặt mình làm quản trị viên của nhóm này để mình hoạt động được.",
+    "uk": "Зробіть мене адміністратором цієї групи, щоб я міг тут працювати.",
+    "id": "Jadikan aku admin grup ini supaya aku bisa bekerja di sini.",
+    "ms": "Jadikan saya admin kumpulan ini supaya saya boleh berfungsi di sini.",
+    "ko": "이 그룹의 관리자로 지정해 주세요. 그래야 여기서 일할 수 있어요.",
+    "pt": "Me torne administrador deste grupo para que eu possa funcionar aqui.",
+    "zh": "请把我设为本群管理员，这样我才能在这里工作。",
+    "fr": "Fais de moi un administrateur de ce groupe pour que je puisse y fonctionner.",
+    "de": "Mach mich zum Admin dieser Gruppe, damit ich hier arbeiten kann.",
+    "it": "Rendimi amministratore di questo gruppo così posso lavorare qui.",
+    "he": "הפוך אותי למנהל בקבוצה הזו כדי שאוכל לעבוד כאן.",
+    "nl": "Maak me beheerder van deze groep zodat ik hier kan werken.",
+    "sv": "Gör mig till admin i den här gruppen så att jag kan arbeta här.",
+}
+for _code, _text in _NEED_ADMIN.items():
+    T[_code]["a_needadmin"] = _text
+
 class _Safe(dict):
     def __missing__(self, key):
         return "{" + key + "}"
