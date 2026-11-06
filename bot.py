@@ -621,6 +621,39 @@ def schedule_delete(*messages: Message, delay: int = None):
     task.add_done_callback(_tasks.discard)
 
 
+def schedule_file_delete(client: Client, sent: Message, user, lang: str, msg_id: int, title: str):
+    """After the auto-delete time: the file is deleted, then the user gets a notice with a button that
+    sends the same file again."""
+    delay = AUTO_DELETE_SECONDS
+    if delay <= 0:
+        return
+
+    async def _job():
+        await asyncio.sleep(delay)
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+        try:
+            await client.send_message(
+                user.id,
+                f"✗ <b>{tr(lang, 'a_deleted')}</b>\n"
+                + LINE
+                + f"\n{file_icon(title)} {esc(tagged(title)[:150])}\n"
+                f"◇ {tr(lang, 'f_autodel', minutes=minutes())}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[btn(f"↻ {tr(lang, 'b_again')}", GREEN, callback_data=f"again|{msg_id}")]]
+                ),
+                link_preview_options=NO_PREVIEW,
+            )
+        except Exception as e:
+            log.warning("Could not send the 'file deleted' notice to %s (%s)", user.id, e)
+
+    task = asyncio.create_task(_job())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
 def plain_len(text: str) -> int:
     return len(re.sub(r"<[^>]+>", "", text or ""))
 
@@ -2436,7 +2469,7 @@ async def send_file(client: Client, user, lang: str, msg_id: int, errors: list =
             return None
 
     log_file_sent(user, title, size)
-    schedule_delete(sent)
+    schedule_file_delete(client, sent, user, lang, msg_id, title)
     return sent
 
 
@@ -2448,6 +2481,26 @@ async def deliver_pending(client: Client, user, chat_id: int, lang: str) -> bool
     if not await send_file(client, user, lang, msg_id):
         await client.send_message(chat_id, tr(lang, "a_filefail"))
     return True
+
+
+@app.on_callback_query(filters.regex(r"^again\|"))
+@safe
+async def again_cb(client: Client, cq: CallbackQuery):
+    """'Request this file again' (under the 'file deleted' notice): sends the same file to the same user."""
+    lang = await lang_of(cq.from_user)
+    missing = await not_joined(client, cq.from_user.id)
+    if missing:
+        await cq.answer(tr(lang, "a_joinfirst"), show_alert=True)
+        text, kb = await join_view(missing, lang)
+        return await client.send_message(cq.from_user.id, text, reply_markup=kb)
+    msg_id = int(cq.data.split("|")[1])
+    if not await send_file(client, cq.from_user, lang, msg_id):
+        return await cq.answer(tr(lang, "a_filefail"), show_alert=True)
+    await cq.answer(f"□ {tr(lang, 'a_filesent')} ✓")
+    try:
+        await cq.message.delete()  # the notice is not needed any more
+    except Exception:
+        pass
 
 
 @app.on_callback_query(filters.regex(r"^get\|"))
