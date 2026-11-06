@@ -756,6 +756,35 @@ _NEED_ADMIN = {
 for _code, _text in _NEED_ADMIN.items():
     T[_code]["a_needadmin"] = _text
 
+
+# notice after the auto-delete + the button under it
+_DELETED = {
+    "en": ("File deleted", "Request this file again"),
+    "hi": ("फ़ाइल डिलीट हो गई", "यह फ़ाइल दोबारा माँगें"),
+    "fa": ("فایل حذف شد", "درخواست دوباره این فایل"),
+    "uz": ("Fayl o'chirildi", "Bu faylni qayta so'rash"),
+    "ru": ("Файл удалён", "Запросить файл снова"),
+    "es": ("Archivo eliminado", "Pedir este archivo otra vez"),
+    "ar": ("تم حذف الملف", "اطلب هذا الملف مرة أخرى"),
+    "tr": ("Dosya silindi", "Bu dosyayı tekrar iste"),
+    "vi": ("Tệp đã bị xóa", "Yêu cầu lại tệp này"),
+    "uk": ("Файл видалено", "Запросити файл знову"),
+    "id": ("File dihapus", "Minta file ini lagi"),
+    "ms": ("Fail dipadam", "Minta fail ini sekali lagi"),
+    "ko": ("파일이 삭제되었어요", "이 파일 다시 요청하기"),
+    "pt": ("Arquivo excluído", "Pedir este arquivo novamente"),
+    "zh": ("文件已删除", "再次获取此文件"),
+    "fr": ("Fichier supprimé", "Redemander ce fichier"),
+    "de": ("Datei gelöscht", "Datei erneut anfordern"),
+    "it": ("File eliminato", "Richiedi di nuovo questo file"),
+    "he": ("הקובץ נמחק", "בקש את הקובץ שוב"),
+    "nl": ("Bestand verwijderd", "Dit bestand opnieuw aanvragen"),
+    "sv": ("Filen raderad", "Begär filen igen"),
+}
+for _code, (_gone, _again) in _DELETED.items():
+    T[_code]["a_deleted"] = _gone
+    T[_code]["b_again"] = _again
+
 class _Safe(dict):
     def __missing__(self, key):
         return "{" + key + "}"
