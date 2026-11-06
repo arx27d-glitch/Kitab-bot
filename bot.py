@@ -188,12 +188,11 @@ AUTO_GROUP = parse_chat(_auto_raw) if _auto_raw else LOG_GROUP
 # false = messages of admins/owners are not mirrored (true is handy while testing with your own account)
 MIRROR_ADMINS = env_bool("MIRROR_ADMIN_MESSAGES", "false")
 
-# Groups where ALL users can use the bot's commands (/start /help /language /search):
-# SOURCE_GROUPS + LOG_GROUP + AUTO_REPLY_GROUP + the groups listed in USER_GROUPS.
-# Owner/admin commands work in private chat and in LOG_GROUP / AUTO_REPLY_GROUP only.
-USER_GROUPS = [parse_chat(x) for x in env("USER_GROUPS").replace(",", " ").split()]
-# true = a normal text message in those groups is also searched (silently ignored when nothing is found).
-# The bot must be ADMIN in the group, or privacy mode must be OFF (BotFather /setprivacy -> Disable)
+# GROUPS (no list to maintain): in a group where the bot is ADMIN everybody can use /start /help /language
+# /search (and plain text search). In a group where the bot is NOT admin only /start works, and it asks
+# for admin rights. Owner/admin commands work in private chat and in LOG_GROUP / AUTO_REPLY_GROUP only.
+# true = a normal text message in a group (where the bot is admin) is also searched; the bot stays silent
+# when nothing is found.
 GROUP_TEXT_SEARCH = env_bool("GROUP_TEXT_SEARCH", "true")
 # true = plain /start always shows the language buttons first (false = only the first time)
 ASK_LANGUAGE_ON_START = env_bool("ASK_LANGUAGE_ON_START", "true")
@@ -351,37 +350,55 @@ admin_filter = filters.create(_admin_check)
 # sirf env wale owners (/addadmin, /deladmin ke liye)
 owner_filter = filters.user(ADMINS)
 
-# Group ids (usernames are turned into ids when the bot starts, see resolve_groups)
+# Log / auto-reply groups (usernames are turned into ids when the bot starts, see resolve_groups)
 ADMIN_GROUPS = {g for g in (LOG_GROUP, AUTO_GROUP) if isinstance(g, int) and g}
-USER_GROUP_IDS = (
-    set(ADMIN_GROUPS)
-    | {g for g in SOURCE_GROUPS if isinstance(g, int)}
-    | {g for g in USER_GROUPS if isinstance(g, int)}
-)
+
+_admin_cache: dict = {}  # group id -> (is the bot admin there?, time it was checked)
 
 
-DYNAMIC_GROUPS = set()  # groups added with /addgroup (saved in the database)
+async def bot_is_admin(client, chat_id: int) -> bool:
+    """Is the bot an admin of this group? (cached; refreshed when the bot's status changes)"""
+    now = time.time()
+    hit = _admin_cache.get(chat_id)
+    if hit and now - hit[1] < (300 if hit[0] else 20):
+        return hit[0]
+    try:
+        me = await client.get_chat_member(chat_id, "me")
+        ok = me.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+    except Exception:
+        ok = False
+    if len(_admin_cache) > 2000:
+        _admin_cache.clear()
+    _admin_cache[chat_id] = (ok, now)
+    return ok
 
 
 async def _in_admin_groups(_, __, m):
     return bool(getattr(m, "chat", None)) and m.chat.id in ADMIN_GROUPS
 
 
-async def _in_user_groups(_, __, m):
-    return bool(getattr(m, "chat", None)) and m.chat.id in USER_GROUP_IDS
+async def _bot_admin_here(_, client, m):
+    return bool(getattr(m, "chat", None)) and await bot_is_admin(client, m.chat.id)
 
 
-async def _in_search_groups(_, __, m):  # plain-text search: user groups, but never the log group
-    return bool(getattr(m, "chat", None)) and m.chat.id in USER_GROUP_IDS and m.chat.id not in ADMIN_GROUPS
+async def _bot_not_admin_here(_, client, m):
+    return bool(getattr(m, "chat", None)) and not await bot_is_admin(client, m.chat.id)
 
 
-# admin_place: private chat + log/auto-reply group      user_place: private chat + my groups
+async def _search_group(_, client, m):  # plain-text search: groups where the bot is admin, never the log groups
+    return bool(getattr(m, "chat", None)) and m.chat.id not in ADMIN_GROUPS and await bot_is_admin(client, m.chat.id)
+
+
+# admin_place: private chat + log/auto-reply group
+# user_place : private chat + every group where the bot is admin
 admin_place = filters.private | filters.create(_in_admin_groups)
-user_place = filters.private | filters.create(_in_user_groups)
+group_admin = filters.group & filters.create(_bot_admin_here)
+group_not_admin = filters.group & filters.create(_bot_not_admin_here)
+user_place = filters.private | group_admin
 
 
 async def resolve_groups():
-    """Turns @usernames of groups into ids and fills the group lists."""
+    """Turns @usernames of the log / auto-reply groups into ids."""
     global LOG_GROUP, AUTO_GROUP
 
     async def to_id(ref):
@@ -397,13 +414,6 @@ async def resolve_groups():
     AUTO_GROUP = await to_id(AUTO_GROUP)
     ADMIN_GROUPS.clear()
     ADMIN_GROUPS.update(g for g in (LOG_GROUP, AUTO_GROUP) if isinstance(g, int) and g)
-    USER_GROUP_IDS.clear()
-    USER_GROUP_IDS.update(ADMIN_GROUPS)
-    USER_GROUP_IDS.update(DYNAMIC_GROUPS)
-    for ref in list(SOURCE_GROUPS) + list(USER_GROUPS):
-        gid = await to_id(ref)
-        if isinstance(gid, int):
-            USER_GROUP_IDS.add(gid)
 
 
 async def load_admins():
@@ -745,7 +755,6 @@ def help_text(is_admin: bool, is_owner: bool = False, lang: str = "en") -> str:
             "/delstart - remove the start image\n"
             "/admins - list admins\n"
             "/diag - check the bot (database, channels, sending a test file)\n"
-            "/addgroup - send it inside a group: everybody can use the bot there (/delgroup, /groups)\n"
             "/logs - send the latest logs + all errors to the log group (<code>/logs 800</code>, <code>/logs errors</code>)\n"
             "/ban /unban /banned - block a user from the bot (reply, id or @username)\n"
             "/ping - is the bot alive\n"
@@ -1513,91 +1522,28 @@ async def sent_cmd(client: Client, m: Message):
 
 
 # ----------------------------------------------------------------------------
-# /addgroup /delgroup /groups : admins choose the groups where everybody can use the bot
+# GROUPS: bot is admin -> all user commands work. Bot is not admin -> only /start, and it asks for admin
 # ----------------------------------------------------------------------------
-async def save_groups():
-    await store.set_meta("user_groups", " ".join(str(g) for g in sorted(DYNAMIC_GROUPS)))
-
-
-async def group_target(client: Client, m: Message):
-    """(group id, title) from the group the command was sent in, or from an id / @username."""
-    arg = m.command[1] if len(m.command) > 1 else ""
-    if arg:
-        chat = await client.get_chat(parse_chat(arg))
-        return chat.id, chat.title or str(chat.id)
-    if m.chat.id < 0:
-        return m.chat.id, m.chat.title or str(m.chat.id)
-    return None, None
-
-
-@app.on_message(filters.command("addgroup") & admin_filter)
+@app.on_message(filters.command("start") & group_not_admin)
 @safe
-async def addgroup_cmd(client: Client, m: Message):
+async def start_need_admin(client: Client, m: Message):
+    if not m.from_user:
+        return
+    lang = await lang_of(m.from_user)
+    kb = None
+    if BOT_USERNAME:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"♡ @{BOT_USERNAME}", url=f"https://t.me/{BOT_USERNAME}")]])
+    reply = await m.reply(f"♛ {tr(lang, 'a_needadmin')}", reply_markup=kb, quote=True)
+    schedule_delete(reply)
+
+
+@app.on_chat_member_updated()
+async def bot_status_changed(_, update):
+    """The bot was made admin (or removed) -> forget the cached answer, the next message uses the new status."""
     try:
-        gid, title = await group_target(client, m)
-    except Exception as e:
-        return await m.reply(f"✗ Group not found: {esc(e)}\nAdd the bot to the group first.", quote=True)
-    if gid is None or gid > 0:
-        return await m.reply(
-            "♤ <b>Add Group</b>\n" + LINE + "\nSend <code>/addgroup</code> <b>inside the group</b>,\n"
-            "or <code>/addgroup -1001234567890</code> here.",
-            quote=True,
-        )
-    DYNAMIC_GROUPS.add(gid)
-    USER_GROUP_IDS.add(gid)
-    await save_groups()
-    await m.reply(
-        "✓ <b>Group Added</b>\n"
-        + LINE
-        + f"\n◇ {esc(title)}\n¤ ID: <code>{gid}</code>\n"
-        "☆ Everybody can use /search /help /language here. Result buttons open the bot.\n"
-        + (
-            "☆ Plain text search: <b>ON</b> - for this the bot must be <b>admin</b> in the group "
-            "(or BotFather /setprivacy -> Disable)."
-            if GROUP_TEXT_SEARCH
-            else "◇ Plain text search is OFF (GROUP_TEXT_SEARCH=false)."
-        ),
-        quote=True,
-    )
-
-
-@app.on_message(filters.command("delgroup") & admin_filter)
-@safe
-async def delgroup_cmd(client: Client, m: Message):
-    try:
-        gid, title = await group_target(client, m)
-    except Exception as e:
-        return await m.reply(f"✗ Group not found: {esc(e)}", quote=True)
-    if gid is None or gid > 0:
-        return await m.reply("Usage: <code>/delgroup</code> inside the group, or <code>/delgroup -100...</code>", quote=True)
-    if gid not in DYNAMIC_GROUPS:
-        return await m.reply("¤ This group was not added with /addgroup (groups from .env can't be removed here).", quote=True)
-    DYNAMIC_GROUPS.discard(gid)
-    USER_GROUP_IDS.discard(gid)
-    await save_groups()
-    await m.reply(f"✗ <b>Group Removed</b>\n{LINE}\n◇ {esc(title)}", quote=True)
-
-
-@app.on_message(filters.command("groups") & admin_place & admin_filter)
-@safe
-async def groups_cmd(client: Client, m: Message):
-    rows = []
-    for gid in sorted(USER_GROUP_IDS):
-        try:
-            title = (await client.get_chat(gid)).title
-        except Exception:
-            title = "? (bot is not in this group)"
-        where = []
-        if gid in ADMIN_GROUPS:
-            where.append("admin cmds")
-        if gid in DYNAMIC_GROUPS:
-            where.append("/addgroup")
-        rows.append(f"◇ {esc(title)}\n   <code>{gid}</code> {'• ' + ', '.join(where) if where else ''}")
-    await m.reply(
-        "☆ <b>Groups</b>\n" + LINE + "\n" + ("\n".join(rows) if rows else "none") + "\n" + LINE
-        + f"\nPlain text search: <b>{'ON' if GROUP_TEXT_SEARCH else 'OFF'}</b>",
-        quote=True,
-    )
+        _admin_cache.pop(update.chat.id, None)
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -1817,9 +1763,9 @@ async def diag_cmd(client: Client, m: Message):
             add(False, f"{name} {ref}: {esc(e)}")
 
     add(bool(BOT_USERNAME), f"Bot username: @{BOT_USERNAME or '?'} (group buttons need it)")
-    add(None, f"Groups for users: {len(USER_GROUP_IDS)} • plain text search in groups: "
+    add(None, f"Groups: commands work where the bot is admin • plain text search in groups: "
               f"{'ON' if GROUP_TEXT_SEARCH else 'OFF'} • language on every /start: {'ON' if ASK_LANGUAGE_ON_START else 'OFF'}")
-    add(None, f"Admins: {len(ALL_ADMINS)} • user groups: {len(USER_GROUP_IDS)}")
+    add(None, f"Admins: {len(ALL_ADMINS)}")
     await status.edit_text("♤ <b>Diagnosis</b>\n" + LINE + "\n" + "\n".join(lines))
 
 
@@ -2308,7 +2254,7 @@ async def search_cmd(client: Client, m: Message):
 if GROUP_TEXT_SEARCH:
 
     @app.on_message(
-        filters.text & filters.group & filters.create(_in_search_groups) & ~filters.regex(r"^/"),
+        filters.text & filters.group & filters.create(_search_group) & ~filters.regex(r"^/"),
         group=2,
     )
     async def group_text_search(client: Client, m: Message):
@@ -2582,8 +2528,6 @@ async def set_menu_commands():
         BotCommand("ban", "Ban a user"),
         BotCommand("unban", "Unban a user"),
         BotCommand("ping", "Is the bot alive?"),
-        BotCommand("addgroup", "Allow users in a group"),
-        BotCommand("groups", "List groups"),
         BotCommand("sent", "Send a message/file to a user"),
     ]
     owner_cmds = admin_cmds + [
@@ -2610,9 +2554,6 @@ async def main():
     if hasattr(store, "notify"):
         store.notify = notify_admins  # tells admins when a MongoDB gets full
     await load_admins()
-    DYNAMIC_GROUPS.update(
-        int(x) for x in (await store.get_meta("user_groups", "")).split() if x.lstrip("-").isdigit()
-    )
     BANNED.update(int(x) for x in (await store.get_meta("banned", "")).split() if x.lstrip("-").isdigit())
     saved_db = await store.get_meta("db_channel", "")
     if saved_db.lstrip("-").isdigit():
@@ -2628,7 +2569,7 @@ async def main():
     log.info("Admins: %s", sorted(ALL_ADMINS))
     log.info("DB channel: %s", DB_CHANNEL)
     log.info("Log group: %s | Auto-reply group: %s", LOG_GROUP or "none", AUTO_GROUP or "none")
-    log.info("Groups where users can use commands: %s", sorted(USER_GROUP_IDS) or "none")
+    log.info("Groups: commands work in every group where the bot is admin")
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
