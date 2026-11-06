@@ -1,6 +1,10 @@
 import asyncio
+import collections
+import functools
 import html
+import io
 import logging
+import logging.handlers
 import math
 import os
 import re
@@ -8,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from pyrogram import Client, enums, filters, idle
+from pyrogram import Client, StopPropagation, enums, filters, idle
 from pyrogram.errors import (
     FloodWait,
     InputUserDeactivated,
@@ -29,13 +33,47 @@ from pyrogram.types import (
 )
 
 from i18n import LANGS, detect_lang, tr
-from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, detect_languages, detect_quality, detect_seasons
-from translit import phonetic_key, phonetic_words, to_latin
+from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
+from translit import phonetic_rank, to_latin
 from storage import MongoStore, MultiMongoStore, SqliteStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bookbot")
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+class RingHandler(logging.Handler):
+    """Keeps the latest log lines in memory, so /logs can send them to the log group."""
+
+    def __init__(self, capacity: int = 3000):
+        super().__init__()
+        self.lines = collections.deque(maxlen=capacity)
+        self.errors = collections.deque(maxlen=800)  # warnings + errors (with tracebacks)
+
+    def emit(self, record):
+        try:
+            line = self.format(record)
+            self.lines.append(line)
+            if record.levelno >= logging.WARNING:
+                self.errors.append(line)
+        except Exception:
+            pass
+
+
+_log_fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+_log_fmt.converter = lambda secs: datetime.fromtimestamp(secs, IST).timetuple()  # log times are IST
+RING = RingHandler()
+RING.setFormatter(_log_fmt)
+logging.getLogger().addHandler(RING)
+_log_file = os.environ.get("LOG_FILE", "bot.log").strip()
+if _log_file and _log_file.lower() != "off":  # also written to a file (1 MB x 3 files)
+    try:
+        _fh = logging.handlers.RotatingFileHandler(_log_file, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        _fh.setFormatter(_log_fmt)
+        logging.getLogger().addHandler(_fh)
+    except Exception:
+        pass
 START_TIME = time.time()
 
 
@@ -93,6 +131,15 @@ START_PIC = env("START_PIC")  # optional default welcome photo (admin can overri
 AUTO_DELETE_SECONDS = int(env("AUTO_DELETE_SECONDS", "300"))  # 300 = 5 minutes, 0 = off
 RESULTS_PER_PAGE = int(env("RESULTS_PER_PAGE", "8"))
 
+# Text added at the end of every file name (buttons + caption), before the extension. "" = off
+FILE_TAG = env("FILE_TAG", "[@OVN3RS]")
+# 0 = the tag is only shown in buttons/caption. A number (MB) = files up to this size are re-uploaded with
+# the new real file name (slower, uses bandwidth). Bigger files keep their name, the caption has the tag.
+RENAME_MAX_MB = int(env("RENAME_MAX_MB", "0") or 0)
+# A user may do at most FLOOD_LIMIT searches in FLOOD_WINDOW seconds (admins are free). 0 = off
+FLOOD_LIMIT = int(env("FLOOD_LIMIT", "8") or 0)
+FLOOD_WINDOW = int(env("FLOOD_WINDOW", "20") or 20)
+
 # Optional: custom text. You can use {mention} {first_name} {bot_name} {minutes}
 START_TEXT_ENV = env("START_TEXT").replace("\\n", "\n")
 JOIN_TEXT_ENV = env("JOIN_TEXT").replace("\\n", "\n")
@@ -145,8 +192,11 @@ MIRROR_ADMINS = env_bool("MIRROR_ADMIN_MESSAGES", "false")
 # SOURCE_GROUPS + LOG_GROUP + AUTO_REPLY_GROUP + the groups listed in USER_GROUPS.
 # Owner/admin commands work in private chat and in LOG_GROUP / AUTO_REPLY_GROUP only.
 USER_GROUPS = [parse_chat(x) for x in env("USER_GROUPS").replace(",", " ").split()]
-# true = a normal text message in those groups is also searched (needs privacy mode OFF in BotFather)
-GROUP_TEXT_SEARCH = env_bool("GROUP_TEXT_SEARCH", "false")
+# true = a normal text message in those groups is also searched (silently ignored when nothing is found).
+# The bot must be ADMIN in the group, or privacy mode must be OFF (BotFather /setprivacy -> Disable)
+GROUP_TEXT_SEARCH = env_bool("GROUP_TEXT_SEARCH", "true")
+# true = plain /start always shows the language buttons first (false = only the first time)
+ASK_LANGUAGE_ON_START = env_bool("ASK_LANGUAGE_ON_START", "true")
 
 if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
     raise SystemExit("API_ID, API_HASH, BOT_TOKEN and DB_CHANNEL are required (see .env).")
@@ -235,6 +285,31 @@ def file_icon(title: str) -> str:
     return "☆"
 
 
+def tagged(title: str) -> str:
+    """File name with the tag at its end: 'KGF 1080p.mkv' -> 'KGF 1080p [@OVN3RS].mkv'."""
+    title = title or ""
+    if not FILE_TAG or FILE_TAG.lower() in title.lower():
+        return title
+    base, dot, ext = title.rpartition(".")
+    if dot and base and 1 <= len(ext) <= 5 and ext.isalnum():
+        return f"{base} {FILE_TAG}.{ext}"
+    return f"{title} {FILE_TAG}"
+
+
+def button_name(title: str, limit: int = 40) -> str:
+    """Name for a button: shortened in the middle of the name, the tag always stays visible at the end."""
+    title = title or ""
+    if not FILE_TAG:
+        return title[:limit]
+    base, dot, ext = title.rpartition(".")
+    name = base if (dot and base and 1 <= len(ext) <= 5 and ext.isalnum()) else title
+    name = name.replace(FILE_TAG, "").strip()
+    room = max(limit - len(FILE_TAG) - 1, 8)
+    if len(name) > room:
+        name = name[: room - 1].rstrip() + "…"
+    return f"{name} {FILE_TAG}"
+
+
 def progress_bar(done: int, total: int, width: int = 8) -> str:
     total = max(total, 1)
     filled = round(width * done / total)
@@ -285,6 +360,9 @@ USER_GROUP_IDS = (
 )
 
 
+DYNAMIC_GROUPS = set()  # groups added with /addgroup (saved in the database)
+
+
 async def _in_admin_groups(_, __, m):
     return bool(getattr(m, "chat", None)) and m.chat.id in ADMIN_GROUPS
 
@@ -321,6 +399,7 @@ async def resolve_groups():
     ADMIN_GROUPS.update(g for g in (LOG_GROUP, AUTO_GROUP) if isinstance(g, int) and g)
     USER_GROUP_IDS.clear()
     USER_GROUP_IDS.update(ADMIN_GROUPS)
+    USER_GROUP_IDS.update(DYNAMIC_GROUPS)
     for ref in list(SOURCE_GROUPS) + list(USER_GROUPS):
         gid = await to_id(ref)
         if isinstance(gid, int):
@@ -476,6 +555,41 @@ def log_file_sent(user, title: str, size: int):
 
 
 _tasks = set()
+_err_seen: dict = {}
+
+
+def safe(fn):
+    """Handler wrapper: an error is logged with its traceback, sent to the admins (once per 5 minutes
+    for the same error) and the user gets a short message instead of silence."""
+
+    @functools.wraps(fn)
+    async def wrapper(client, update, *args, **kwargs):
+        try:
+            return await fn(client, update, *args, **kwargs)
+        except Exception as e:
+            if type(e).__name__ in ("StopPropagation", "ContinuePropagation"):
+                raise
+            log.exception("Error in %s", fn.__name__)
+            key = (fn.__name__, type(e).__name__, str(e)[:80])
+            if time.time() - _err_seen.get(key, 0) > 300:
+                _err_seen[key] = time.time()
+                card = f"▲ <b>Error in {esc(fn.__name__)}</b>\n{esc(type(e).__name__)}: {esc(str(e)[:400])}\n◇ {now_ist()}"
+                try:
+                    await notify_admins(card)
+                except Exception:
+                    pass
+                group_text(LOG_GROUP, card)
+            try:
+                user = getattr(update, "from_user", None)
+                lang = await lang_of(user) if user else "en"
+                if type(update).__name__ == "CallbackQuery":
+                    await update.answer(tr(lang, "a_filefail"), show_alert=True)
+                else:
+                    await update.reply(tr(lang, "a_filefail"), quote=True)
+            except Exception:
+                pass
+
+    return wrapper
 
 
 def schedule_delete(*messages: Message, delay: int = None):
@@ -630,6 +744,11 @@ def help_text(is_admin: bool, is_owner: bool = False, lang: str = "en") -> str:
             "/setstart - set the start image (send a photo with caption or reply to a photo)\n"
             "/delstart - remove the start image\n"
             "/admins - list admins\n"
+            "/diag - check the bot (database, channels, sending a test file)\n"
+            "/addgroup - send it inside a group: everybody can use the bot there (/delgroup, /groups)\n"
+            "/logs - send the latest logs + all errors to the log group (<code>/logs 800</code>, <code>/logs errors</code>)\n"
+            "/ban /unban /banned - block a user from the bot (reply, id or @username)\n"
+            "/ping - is the bot alive\n"
             "/sent - send a message/file to a user (<code>/sent user_id text</code>, or reply to a file)"
         )
     if is_owner:
@@ -898,56 +1017,36 @@ async def mirror_handler(client: Client, m: Message):
 # USER COMMANDS
 # ----------------------------------------------------------------------------
 async def open_home(client: Client, chat_id: int, user):
-    """Language -> Force Join -> Pending File / Welcome."""
-
-    # STEP 1: Language selection
-    if not await has_chosen_lang(user.id):
-        return await client.send_message(
-            chat_id,
-            lang_pick_text(),
-            reply_markup=lang_keyboard(),
-            link_preview_options=NO_PREVIEW,
-        )
-
-    # STEP 2: Force Join check
+    """After the language is known: force-join screen or the welcome message."""
     lang = await lang_of(user)
     missing = await not_joined(client, user.id)
-
     if missing:
         text, kb = await join_view(missing, lang)
-        return await client.send_message(
-            chat_id,
-            text,
-            reply_markup=kb,
-            link_preview_options=NO_PREVIEW,
-        )
-
-    # STEP 3: Pending File or Welcome
+        return await client.send_message(chat_id, text, reply_markup=kb, link_preview_options=NO_PREVIEW)
     if await deliver_pending(client, user, chat_id, lang):
         return
-
     await send_welcome(client, chat_id, user, lang)
 
 
 @app.on_message(filters.command("start") & user_place)
+@safe
 async def start_cmd(client: Client, m: Message):
-
-    if m.chat.id > 0:
+    if m.chat.id > 0:  # private chat only: groups are not saved as bot users / start cards
         is_new = await register_user(m.from_user.id)
-        await log_start(client, m.from_user, is_new)
-
-        wanted = (
-            re.fullmatch(r"f(\d{1,12})", m.command[1])
-            if len(m.command) > 1 else None
-        )
-
-        if wanted:
+        wanted = re.fullmatch(r"f(\d{1,12})", m.command[1]) if len(m.command) > 1 else None
+        if is_new or not wanted:
+            await log_start(client, m.from_user, is_new)
+        if wanted:  # he came from a button of a group: remember the file
             if len(_pending_file) > 5000:
                 _pending_file.clear()
-
             _pending_file[m.from_user.id] = int(wanted.group(1))
-
+    chosen = await has_chosen_lang(m.from_user.id)
+    plain_start = not (m.chat.id > 0 and len(m.command) > 1)  # no file link behind it
+    # order: 1) language buttons  2) force-join  3) welcome
+    if not chosen or (ASK_LANGUAGE_ON_START and plain_start and m.chat.id > 0):
+        return await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
     await open_home(client, m.chat.id, m.from_user)
+
 
 @app.on_message(filters.command("language") & user_place)
 async def language_cmd(_, m: Message):
@@ -961,29 +1060,21 @@ async def lang_open_cb(_, cq: CallbackQuery):
 
 
 @app.on_callback_query(filters.regex(r"^lg\|"))
+@safe
 async def lang_cb(client: Client, cq: CallbackQuery):
-
     code = cq.data.split("|", 1)[1]
-
     if code not in LANGS:
         return await cq.answer()
-
     await set_lang(cq.from_user.id, code)
-
-    await cq.answer(
-        tr(code, "lang_set", lang=LANGS[code][0])
-    )
-
+    await cq.answer(tr(code, "lang_set", lang=LANGS[code][0]))
     try:
         await cq.message.delete()
     except Exception:
         pass
-
-    await open_home(
-        client,
-        cq.message.chat.id,
-        cq.from_user,
-    )
+    pending = _pending_query.pop(cq.from_user.id, None)
+    if pending:  # he had typed a movie name before choosing the language
+        return await do_search(client, pending[0], pending[1])
+    await open_home(client, cq.message.chat.id, cq.from_user)
 
 
 @app.on_message(filters.command("help") & user_place)
@@ -1422,6 +1513,317 @@ async def sent_cmd(client: Client, m: Message):
 
 
 # ----------------------------------------------------------------------------
+# /addgroup /delgroup /groups : admins choose the groups where everybody can use the bot
+# ----------------------------------------------------------------------------
+async def save_groups():
+    await store.set_meta("user_groups", " ".join(str(g) for g in sorted(DYNAMIC_GROUPS)))
+
+
+async def group_target(client: Client, m: Message):
+    """(group id, title) from the group the command was sent in, or from an id / @username."""
+    arg = m.command[1] if len(m.command) > 1 else ""
+    if arg:
+        chat = await client.get_chat(parse_chat(arg))
+        return chat.id, chat.title or str(chat.id)
+    if m.chat.id < 0:
+        return m.chat.id, m.chat.title or str(m.chat.id)
+    return None, None
+
+
+@app.on_message(filters.command("addgroup") & admin_filter)
+@safe
+async def addgroup_cmd(client: Client, m: Message):
+    try:
+        gid, title = await group_target(client, m)
+    except Exception as e:
+        return await m.reply(f"✗ Group not found: {esc(e)}\nAdd the bot to the group first.", quote=True)
+    if gid is None or gid > 0:
+        return await m.reply(
+            "♤ <b>Add Group</b>\n" + LINE + "\nSend <code>/addgroup</code> <b>inside the group</b>,\n"
+            "or <code>/addgroup -1001234567890</code> here.",
+            quote=True,
+        )
+    DYNAMIC_GROUPS.add(gid)
+    USER_GROUP_IDS.add(gid)
+    await save_groups()
+    await m.reply(
+        "✓ <b>Group Added</b>\n"
+        + LINE
+        + f"\n◇ {esc(title)}\n¤ ID: <code>{gid}</code>\n"
+        "☆ Everybody can use /search /help /language here. Result buttons open the bot.\n"
+        + (
+            "☆ Plain text search: <b>ON</b> - for this the bot must be <b>admin</b> in the group "
+            "(or BotFather /setprivacy -> Disable)."
+            if GROUP_TEXT_SEARCH
+            else "◇ Plain text search is OFF (GROUP_TEXT_SEARCH=false)."
+        ),
+        quote=True,
+    )
+
+
+@app.on_message(filters.command("delgroup") & admin_filter)
+@safe
+async def delgroup_cmd(client: Client, m: Message):
+    try:
+        gid, title = await group_target(client, m)
+    except Exception as e:
+        return await m.reply(f"✗ Group not found: {esc(e)}", quote=True)
+    if gid is None or gid > 0:
+        return await m.reply("Usage: <code>/delgroup</code> inside the group, or <code>/delgroup -100...</code>", quote=True)
+    if gid not in DYNAMIC_GROUPS:
+        return await m.reply("¤ This group was not added with /addgroup (groups from .env can't be removed here).", quote=True)
+    DYNAMIC_GROUPS.discard(gid)
+    USER_GROUP_IDS.discard(gid)
+    await save_groups()
+    await m.reply(f"✗ <b>Group Removed</b>\n{LINE}\n◇ {esc(title)}", quote=True)
+
+
+@app.on_message(filters.command("groups") & admin_place & admin_filter)
+@safe
+async def groups_cmd(client: Client, m: Message):
+    rows = []
+    for gid in sorted(USER_GROUP_IDS):
+        try:
+            title = (await client.get_chat(gid)).title
+        except Exception:
+            title = "? (bot is not in this group)"
+        where = []
+        if gid in ADMIN_GROUPS:
+            where.append("admin cmds")
+        if gid in DYNAMIC_GROUPS:
+            where.append("/addgroup")
+        rows.append(f"◇ {esc(title)}\n   <code>{gid}</code> {'• ' + ', '.join(where) if where else ''}")
+    await m.reply(
+        "☆ <b>Groups</b>\n" + LINE + "\n" + ("\n".join(rows) if rows else "none") + "\n" + LINE
+        + f"\nPlain text search: <b>{'ON' if GROUP_TEXT_SEARCH else 'OFF'}</b>",
+        quote=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# /logs : latest logs and every error -> LOG_GROUP (as files)
+# ----------------------------------------------------------------------------
+async def send_text_file(client: Client, chat, text: str, name: str, caption: str):
+    data = io.BytesIO(text.encode("utf-8", "replace"))
+    data.name = name
+    await client.send_document(chat, data, file_name=name, caption=caption)
+
+
+@app.on_message(filters.command("logs") & admin_place & admin_filter)
+@safe
+async def logs_cmd(client: Client, m: Message):
+    arg = m.command[1].lower() if len(m.command) > 1 else ""
+    only_errors = arg in ("err", "error", "errors")
+    count = min(int(arg), 3000) if arg.isdigit() else 500
+    target = LOG_GROUP or m.chat.id
+    lines = list(RING.lines)[-count:]
+    errors = list(RING.errors)[-300:]
+    when = now_ist()
+    try:
+        await client.send_message(
+            target,
+            "☆ <b>Logs</b>\n"
+            + LINE
+            + f"\n♛ Asked by: {m.from_user.mention}\n"
+            f"◇ Time: {when}\n"
+            f"◇ Uptime: {fmt_uptime(time.time() - START_TIME)}\n"
+            f"□ Entries: {len(lines)} • warnings/errors: {len(errors)}\n"
+            + LINE,
+            link_preview_options=NO_PREVIEW,
+        )
+        if errors:
+            await send_text_file(
+                client, target, "\n".join(errors), "errors.log", f"✗ Errors and warnings • {when}"
+            )
+        else:
+            await client.send_message(target, f"✓ No errors or warnings since the bot started • {when}")
+        if not only_errors:
+            await send_text_file(client, target, "\n".join(lines), "bot.log", f"☆ Last {len(lines)} log entries • {when}")
+    except Exception as e:
+        return await m.reply(f"✗ Could not send the logs to the log group: {esc(e)}", quote=True)
+    if target != m.chat.id:
+        await m.reply("✓ Logs sent to the log group.", quote=True)
+
+
+@app.on_message(filters.command("ping") & admin_place & admin_filter)
+async def ping_cmd(_, m: Message):
+    start = time.time()
+    sent = await m.reply("◇ ...", quote=True)
+    ms = int((time.time() - start) * 1000)
+    await sent.edit_text(
+        f"✓ <b>Pong</b> {ms} ms\n◇ Uptime: {fmt_uptime(time.time() - START_TIME)}\n"
+        f"☆ Files: {await store.count_files()} • ♧ Users: {await store.count_users()}"
+    )
+
+
+# ----------------------------------------------------------------------------
+# BAN / UNBAN : a banned user is ignored everywhere (private chat, groups, buttons)
+# ----------------------------------------------------------------------------
+BANNED = set()
+
+
+async def save_banned():
+    await store.set_meta("banned", " ".join(str(u) for u in sorted(BANNED)))
+
+
+@app.on_message(filters.all, group=-2)
+async def ban_gate_message(_, m: Message):
+    user = m.from_user
+    if user and user.id in BANNED and user.id not in ALL_ADMINS:
+        raise StopPropagation
+
+
+@app.on_callback_query(group=-2)
+async def ban_gate_callback(_, cq: CallbackQuery):
+    if cq.from_user.id in BANNED and cq.from_user.id not in ALL_ADMINS:
+        await cq.answer("✗", show_alert=True)
+        raise StopPropagation
+
+
+async def ban_target(client: Client, m: Message) -> int:
+    """User id from: /ban 123456 | a bot card (ID: 123) | the replied user | @username."""
+    if len(m.command) > 1:
+        arg = m.command[1].lstrip("@")
+        if re.fullmatch(r"\d{5,15}", arg):
+            return int(arg)
+        try:
+            return (await client.get_users(arg)).id
+        except Exception:
+            return 0
+    card = target_from_card(m.reply_to_message)
+    if card:
+        return card
+    r = m.reply_to_message
+    if r and r.from_user and not getattr(r.from_user, "is_self", False):
+        return r.from_user.id
+    return 0
+
+
+@app.on_message(filters.command("ban") & admin_place & admin_filter)
+@safe
+async def ban_cmd(client: Client, m: Message):
+    uid = await ban_target(client, m)
+    if not uid:
+        return await m.reply(
+            "✗ <b>Ban</b>\n" + LINE + "\n<code>/ban 123456789</code>\n<code>/ban @username</code>\n"
+            "or reply to the user's card/message with <code>/ban</code>",
+            quote=True,
+        )
+    if uid in ALL_ADMINS:
+        return await m.reply("¤ Admins/owners can't be banned.", quote=True)
+    BANNED.add(uid)
+    await save_banned()
+    await m.reply(f"✗ <b>Banned</b> <code>{uid}</code>", quote=True)
+    group_text(
+        AUTO_GROUP,
+        f"✗ <b>User Banned</b>\n{LINE}\n¤ ID: <code>{uid}</code>\n♛ By: {m.from_user.mention}\n◇ Time: {now_ist()}",
+    )
+
+
+@app.on_message(filters.command("unban") & admin_place & admin_filter)
+@safe
+async def unban_cmd(client: Client, m: Message):
+    uid = await ban_target(client, m)
+    if not uid or uid not in BANNED:
+        return await m.reply("Usage: <code>/unban 123456789</code> (the user must be banned)", quote=True)
+    BANNED.discard(uid)
+    await save_banned()
+    await m.reply(f"✓ <b>Unbanned</b> <code>{uid}</code>", quote=True)
+
+
+@app.on_message(filters.command("banned") & admin_place & admin_filter)
+async def banned_cmd(_, m: Message):
+    rows = "\n".join(f"✗ <code>{u}</code>" for u in sorted(BANNED)) or "none"
+    await m.reply(f"✗ <b>Banned Users</b>\n{LINE}\n{rows}", quote=True)
+
+
+# ----------------------------------------------------------------------------
+# /diag : checks every part that sends files and tells what is wrong (admins)
+# ----------------------------------------------------------------------------
+@app.on_message(filters.command("diag") & admin_place & admin_filter)
+async def diag_cmd(client: Client, m: Message):
+    lines = []
+
+    def add(good, text):
+        lines.append(("✓ " if good is True else "✗ " if good is False else "◇ ") + text)
+
+    status = await m.reply("◇ Checking, please wait...", quote=True)
+
+    try:  # 1) library
+        import pyrogram
+
+        add(True, f"Library: pyrogram {getattr(pyrogram, '__version__', '?')} • "
+                  f"button colors: {'yes' if getattr(enums, 'ButtonStyle', None) else 'no'}")
+    except Exception as e:
+        add(False, f"Library: {e}")
+
+    try:  # 2) database
+        add(True, f"Database: {'MongoDB' if store.persistent else 'SQLite (may be lost on restart)'} • "
+                  f"files {await store.count_files()} • users {await store.count_users()}")
+    except Exception as e:
+        add(False, f"Database error: {e}")
+
+    try:  # 3) DB channel
+        chat = await client.get_chat(DB_CHANNEL)
+        me = await client.get_chat_member(chat.id, "me")
+        is_adm = me.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+        add(is_adm, f"DB channel: {esc(chat.title)} ({DB_CHANNEL}) • bot is {'admin' if is_adm else 'NOT admin'}")
+    except Exception as e:
+        add(False, f"DB channel {DB_CHANNEL}: {esc(e)}")
+
+    sample = None
+    try:  # 4) search + buttons
+        found = await store.find_any(["a", "e", "i", "o", "u"], limit=1)
+        if not found:
+            add(False, "No files in the database. Post files in the DB channel or run /index full")
+        else:
+            sample = found[0]
+            word = next((w for w in norm(sample[1]).split() if len(w) >= 3), norm(sample[1])[:3])
+            token = f"diag{m.from_user.id}"
+            cache_query(token, word)
+            text, kb = await build_page(word, 0, token, await lang_of(m.from_user))
+            file_btns = [b for row in kb.rows for b in row if (b.callback_data or "").startswith("get|")] if kb else []
+            add(bool(text and file_btns), f"Search '{esc(word)}': {len(file_btns)} file button(s) shown")
+    except Exception as e:
+        add(False, f"Search/buttons error: {esc(type(e).__name__)}: {esc(e)}")
+
+    if sample:  # 5) real sending
+        errors = []
+        try:
+            sent = await send_file(client, m.from_user, await lang_of(m.from_user), sample[0], errors)
+            add(bool(sent), f"Sending '{esc(sample[1][:40])}' to you: " + ("sent" if sent else "FAILED"))
+            for err in errors:
+                add(False, esc(err[:300]))
+        except Exception as e:
+            add(False, f"Sending error: {esc(type(e).__name__)}: {esc(e)}")
+
+    for ch in await get_force_channels():  # 6) force-join channels
+        try:
+            chat = await client.get_chat(ch["ref"])
+            me = await client.get_chat_member(chat.id, "me")
+            is_adm = me.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+            add(is_adm, f"Join channel {ch['n']}: {esc(chat.title)} • bot {'admin' if is_adm else 'NOT admin (join check will not work)'}")
+        except Exception as e:
+            add(False, f"Join channel {ch['n']} ({ch['ref']}): {esc(e)}")
+
+    for name, ref in (("Log group", LOG_GROUP), ("Auto-reply group", AUTO_GROUP)):  # 7) groups
+        if not ref:
+            add(None, f"{name}: not set")
+            continue
+        try:
+            chat = await client.get_chat(ref)
+            add(True, f"{name}: {esc(chat.title)} ({ref})")
+        except Exception as e:
+            add(False, f"{name} {ref}: {esc(e)}")
+
+    add(bool(BOT_USERNAME), f"Bot username: @{BOT_USERNAME or '?'} (group buttons need it)")
+    add(None, f"Groups for users: {len(USER_GROUP_IDS)} • plain text search in groups: "
+              f"{'ON' if GROUP_TEXT_SEARCH else 'OFF'} • language on every /start: {'ON' if ASK_LANGUAGE_ON_START else 'OFF'}")
+    add(None, f"Admins: {len(ALL_ADMINS)} • user groups: {len(USER_GROUP_IDS)}")
+    await status.edit_text("♤ <b>Diagnosis</b>\n" + LINE + "\n" + "\n".join(lines))
+
+
+# ----------------------------------------------------------------------------
 # OWNER COMMANDS: /del (delete a file from the database) and /dbset (set the DB channel)
 # Only the owners from env ADMINS can use these.
 # ----------------------------------------------------------------------------
@@ -1481,7 +1883,7 @@ async def del_cmd(_, m: Message):
                 f"✗ {human(size)} ┃ {title[:38]}", callback_data=f"dl|{mid}"
             )
         ]
-        for mid, title, size, *_ in shown
+        for mid, title, size in shown
     ]
     rows.append([InlineKeyboardButton("« Cancel", callback_data="dln")])
     more = f"\n▲ Showing 10 of {len(results)}. Use a more specific name." if len(results) > 10 else ""
@@ -1652,70 +2054,6 @@ def cache_query(token: str, query: str):
         _filter_cache.pop(old, None)
 
 
-_EXT_RE = re.compile(
-    r"\.(mkv|mp4|avi|mov|webm|m4v|ts|flv|wmv|mp3|m4a|ogg|wav|flac|pdf|epub|mobi|azw3|zip|rar|7z|srt|txt|doc|docx)$",
-    re.I,
-)
-_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/)[^\s\]\)\}\[\(\{<>\"']+", re.I)
-_DOMAIN_RE = re.compile(
-    r"(?<![\w@/])([A-Za-z0-9-]{4,})\.(?:com|net|org|in|me|xyz|info|io|cc|tv|app|site|online|club|vip|live|link|"
-    r"top|biz|ws|pw|fun|cam|lol|nl|ink|wiki|click|lat|space|store|tech|cyou|monster|ltd)\b(?:/\S*)?",
-    re.I,
-)
-_MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,})")
-_NOT_A_SITE = {
-    "hindi", "dual", "audio", "webrip", "web-dl", "bluray", "brrip", "hdrip", "hdtv", "x264", "x265", "hevc",
-    "esub", "english", "tamil", "telugu", "malayalam", "kannada", "bengali", "punjabi", "1080p", "720p",
-    "480p", "2160p", "4k", "season", "complete", "movie", "movies",
-}
-
-
-def _domain_sub(m):
-    return m.group(0) if m.group(1).lower() in _NOT_A_SITE else " "
-
-
-def _mention_sub(m):
-    return m.group(0) if BOT_USERNAME and m.group(1).lower() == BOT_USERNAME.lower() else " "
-
-
-def clean_title(title: str) -> str:
-    """File name without links / site names / other @usernames (only the bot's own @username stays)."""
-    title = title or ""
-    ext_m = _EXT_RE.search(title)
-    ext = ext_m.group(0) if ext_m else ""
-    base = title[: ext_m.start()] if ext_m else title
-    base = _URL_RE.sub(" ", base)
-    base = _DOMAIN_RE.sub(_domain_sub, base)
-    base = _MENTION_RE.sub(_mention_sub, base)
-    base = re.sub(r"\[\s*[-_|.]*\s*\]|\(\s*[-_|.]*\s*\)|\{\s*[-_|.]*\s*\}", " ", base)
-    base = re.sub(r"\s{2,}", " ", base)
-    base = re.sub(r"(?:\s[-_|•·~+:,]){2,}", " -", base)
-    base = base.strip(" -_|•·:~+,.")
-    return (base or "File") + ext + "" +"@OVN3RS"
-
-
-def file_meta(title: str, extra: str = ""):
-    """(quality, [language codes], [seasons]) read from the file name (+ caption/search text)."""
-    text = f"{title or ''} {extra or ''}"
-    return detect_quality(text), detect_languages(text), detect_seasons(text)
-
-
-def phonetic_rank(words, candidates):
-    """Keeps files whose name sounds like the query (salam = salaam = सलाम), best match first."""
-    keys = phonetic_words(" ".join(words))
-    if not keys:
-        return []
-    need = len(keys) if len(keys) <= 3 else math.ceil(len(keys) * 0.7)
-    scored = []
-    for row in candidates:
-        have = set(phonetic_words(f"{row[1]} {row[3] if len(row) > 3 else ''}"))
-        hits = sum(1 for k in keys if k in have)
-        if hits >= need:
-            scored.append((-hits, (row[1] or "").lower(), row))
-    scored.sort(key=lambda x: (x[0], x[1]))
-    return [r for _, _, r in scored]
-
-
 async def run_search(query: str):
     """(results, fuzzy). Understands other scripts (Hindi, Tamil...) and different spellings."""
     words = norm(query).split()
@@ -1751,7 +2089,7 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         return None, None
 
     # quality / language / season are read from the file names
-    metas = [(r, file_meta(r[1], r[3] if len(r) > 3 else "")) for r in all_results]
+    metas = [(r, file_meta(r[1])) for r in all_results]
     sel = _filter_cache.setdefault(token, {})
 
     def ok(meta, skip=""):
@@ -1822,17 +2160,18 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         text += f"◇ {tr(lang, 'filter')}: <b>{' • '.join(active_parts)}</b>\n"
     if fuzzy:
         text += f"¤ <i>{tr(lang, 'no_exact')}</i>\n"
-    text += LINE + f"\n▼ <b>{tr(lang, 'choose')}</b>"
+    text += LINE + f"\n▼ <b>{tr(lang, 'choose')}</b>" if not group_links else LINE + f"\n▼ {tr(lang, 'step2')}"
 
     rows = []
-    rows += facet_rows("q", q_opts, lambda v: v, 3)
-    rows += facet_rows("l", l_opts, lambda v: LANG_NAMES[v], 3)
-    rows += facet_rows("s", s_opts, lambda v: f"S{v:02d}", 4)
-    if active_parts:
-        rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_clear')}", callback_data=f"f|x|all|{token}")])
+    if not group_links:  # in a group only the file buttons are shown (no filter rows)
+        rows += facet_rows("q", q_opts, lambda v: v, 3)
+        rows += facet_rows("l", l_opts, lambda v: LANG_NAMES[v], 3)
+        rows += facet_rows("s", s_opts, lambda v: f"S{v:02d}", 4)
+        if active_parts:
+            rows.append([InlineKeyboardButton(f"◇ {tr(lang, 'b_clear')}", callback_data=f"f|x|all|{token}")])
 
-    for mid, title, size, *_ in chunk:
-        label = f"{file_icon(title)} {human(size)} ┃ {clean_title(title)[:38]}"
+    for mid, title, size in chunk:
+        label = f"{file_icon(title)} {human(size)} ┃ {button_name(title, 40)}"
         if group_links and BOT_USERNAME:
             # in a group the file is NOT sent: the button opens the bot, which sends the file in private
             rows.append([InlineKeyboardButton(label, url=f"https://t.me/{BOT_USERNAME}?start=f{mid}")])
@@ -1846,7 +2185,8 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         if page < pages - 1:
             nav.append(InlineKeyboardButton("»", callback_data=f"pg|{page + 1}|{token}"))
         rows.append(nav)
-    rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
+    if not group_links:
+        rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1869,22 +2209,57 @@ def not_found_text(query: str, lang: str = "en") -> str:
     & ~filters.command(
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
-            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language", "search", "s", "movie",
+            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language", "search", "s", "movie", "diag", "addgroup", "delgroup", "groups", "logs", "ban", "unban", "banned", "ping",
         ]
     )
 )
+@safe
 async def search_handler(client: Client, m: Message):
     await register_user(m.from_user.id)
     await do_search(client, m, m.text[:100])
 
 
-async def do_search(client: Client, m: Message, query: str):
-    """Searches `query` and replies with the result page (private chat or group)."""
+_pending_query: dict = {}  # user id -> (message, query) waiting while he chooses his language
+
+
+_flood: dict = {}
+
+
+def flood_blocked(user_id: int) -> bool:
+    """True when the user searches too fast (FLOOD_LIMIT searches in FLOOD_WINDOW seconds)."""
+    if FLOOD_LIMIT <= 0 or user_id in ALL_ADMINS:
+        return False
+    now = time.time()
+    if len(_flood) > 5000:
+        _flood.clear()
+    q = _flood.setdefault(user_id, collections.deque())
+    while q and now - q[0] > FLOOD_WINDOW:
+        q.popleft()
+    if len(q) >= FLOOD_LIMIT:
+        return True
+    q.append(now)
+    return False
+
+
+async def do_search(client: Client, m: Message, query: str, silent: bool = False):
+    """Searches `query` and replies with the result page (private chat or group).
+
+    silent=True (plain text in a group): nothing is sent when nothing is found."""
+    if flood_blocked(m.from_user.id):
+        log.info("Flood: ignored a search of %s", m.from_user.id)
+        return
+    private = m.chat.id > 0
+    if private and not await has_chosen_lang(m.from_user.id):  # language first, then the search
+        if len(_pending_query) > 2000:
+            _pending_query.clear()
+        _pending_query[m.from_user.id] = (m, query)
+        return await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
     lang = await lang_of(m.from_user)
-    missing = await not_joined(client, m.from_user.id)
-    if missing:
-        text, kb = await join_view(missing, lang)
-        return await m.reply(text, reply_markup=kb, quote=True)
+    if private:  # in a group the join check is done when the file is opened in the bot
+        missing = await not_joined(client, m.from_user.id)
+        if missing:
+            text, kb = await join_view(missing, lang)
+            return await m.reply(text, reply_markup=kb, quote=True)
 
     try:
         await client.send_chat_action(m.chat.id, enums.ChatAction.TYPING)
@@ -1897,6 +2272,8 @@ async def do_search(client: Client, m: Message, query: str):
 
     if not text:
         log_movie_request(m.from_user, query)
+        if silent:
+            return
         rows = []
         if SUPPORT_USERNAME:
             rows.append([btn(f"♡ {tr(lang, 'b_support')}", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
@@ -1914,6 +2291,7 @@ async def do_search(client: Client, m: Message, query: str):
 
 
 @app.on_message(filters.command(["search", "s", "movie"]) & user_place)
+@safe
 async def search_cmd(client: Client, m: Message):
     """/search KGF - works in private chat and in my groups."""
     if not m.from_user:
@@ -1935,42 +2313,33 @@ if GROUP_TEXT_SEARCH:
     )
     async def group_text_search(client: Client, m: Message):
         user = m.from_user
-        if not user or user.is_bot or not (2 <= len(m.text.strip()) <= 100):
+        if not user or user.is_bot or not (3 <= len(m.text.strip()) <= 100):
             return
-        await do_search(client, m, m.text.strip())
+        await do_search(client, m, m.text.strip(), silent=True)
 
 
 # ----------------------------------------------------------------------------
 # CALLBACKS
 # ----------------------------------------------------------------------------
 @app.on_callback_query(filters.regex(r"^recheck$"))
+@safe
 async def recheck_cb(client: Client, cq: CallbackQuery):
-
     lang = await lang_of(cq.from_user)
     missing = await not_joined(client, cq.from_user.id)
-
     if missing:
-        await cq.answer(
-            tr(lang, "a_notjoined"),
-            show_alert=True,
-        )
-
+        await cq.answer(tr(lang, "a_notjoined"), show_alert=True)
         text, kb = await join_view(missing, lang)
         await edit(cq.message, text, kb)
         return
-
     await cq.answer("☆ " + tr(lang, "a_thanks"))
+    if await deliver_pending(client, cq.from_user, cq.message.chat.id, lang):
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        return
+    await show_home(client, cq, lang)
 
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-
-    await open_home(
-        client,
-        cq.message.chat.id,
-        cq.from_user,
-    )
 
 async def show_home(client: Client, cq: CallbackQuery, lang: str):
     """Welcome screen. If the start picture is set and the message is plain text (after Help), the
@@ -1987,12 +2356,14 @@ async def show_home(client: Client, cq: CallbackQuery, lang: str):
 
 
 @app.on_callback_query(filters.regex(r"^home$"))
+@safe
 async def home_cb(client: Client, cq: CallbackQuery):
     await cq.answer()
     await show_home(client, cq, await lang_of(cq.from_user))
 
 
 @app.on_callback_query(filters.regex(r"^help$"))
+@safe
 async def help_cb(_, cq: CallbackQuery):
     await cq.answer()  # first answer, so the button never keeps "loading"
     lang = await lang_of(cq.from_user)
@@ -2004,6 +2375,7 @@ async def help_cb(_, cq: CallbackQuery):
 
 
 @app.on_callback_query(filters.regex(r"^about$"))
+@safe
 async def about_cb(_, cq: CallbackQuery):
     await cq.answer()
     lang = await lang_of(cq.from_user)
@@ -2026,6 +2398,7 @@ async def close_cb(_, cq: CallbackQuery):
 
 
 @app.on_callback_query(filters.regex(r"^f\|"))
+@safe
 async def filter_cb(client: Client, cq: CallbackQuery):
     _, kind, value, token = cq.data.split("|", 3)
     query = _search_cache.get(token)
@@ -2045,6 +2418,7 @@ async def filter_cb(client: Client, cq: CallbackQuery):
 
 
 @app.on_callback_query(filters.regex(r"^pg\|"))
+@safe
 async def page_cb(client: Client, cq: CallbackQuery):
     _, page, token = cq.data.split("|", 2)
     query = _search_cache.get(token)
@@ -2057,18 +2431,11 @@ async def page_cb(client: Client, cq: CallbackQuery):
 
 
 def file_caption(title: str, size: int, lang: str = "en") -> str:
-    q, langs, seasons = file_meta(title)
     text = (
-        f"{file_icon(title)} <b>{esc(clean_title(title)[:200])}</b>\n"
+        f"{file_icon(title)} <b>{esc(tagged(title)[:200])}</b>\n"
         + LINE
         + f"\n□ {tr(lang, 'size')}: <b>{human(size)}</b>\n"
     )
-    if q:
-        text += f"◇ Quality: <b>{esc(q)}</b>\n"
-    if langs:
-        text += "◇ Language: <b>" + esc(", ".join(LANG_NAMES.get(x, x) for x in langs)) + "</b>\n"
-    if seasons:
-        text += "◇ Season: <b>" + ", ".join(f"S{int(x):02d}" for x in sorted(seasons)) + "</b>\n"
     if AUTO_DELETE_SECONDS > 0:
         text += f"◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
     text += LINE + f"\n✓ <i>{tr(lang, 'save_now')}</i>"
@@ -2080,7 +2447,7 @@ def file_caption(title: str, size: int, lang: str = "en") -> str:
 _pending_file: dict = {}  # user id -> file waiting while he chooses a language / joins the channels
 
 
-async def send_file(client: Client, user, lang: str, msg_id: int):
+async def send_file(client: Client, user, lang: str, msg_id: int, errors: list = None):
     """Sends one file to the user in private. Returns the sent message or None."""
     row = await store.get_file(msg_id)
     title = (row or {}).get("title") or f"file_{msg_id}"
@@ -2089,12 +2456,28 @@ async def send_file(client: Client, user, lang: str, msg_id: int):
     kb = file_keyboard(lang)
     sent = None
 
+    # 0) optional: small files are re-uploaded with the tag in the REAL file name
+    new_name = tagged(title)
+    if RENAME_MAX_MB and row and row.get("file_id") and new_name != title and 0 < size <= RENAME_MAX_MB * 1024 * 1024:
+        try:
+            data = await client.download_media(row["file_id"], in_memory=True)
+            data.name = new_name
+            sent = await client.send_document(
+                user.id, data, file_name=new_name, caption=caption, reply_markup=kb
+            )
+        except Exception as e:
+            log.warning("Could not rename the file while sending (%s), sending it normally", e)
+            if errors is not None:
+                errors.append(f"rename: {type(e).__name__}: {e}")
+
     # 1) Send using the file_id saved in the database (works even after a restart)
-    if row and row.get("file_id"):
+    if not sent and row and row.get("file_id"):
         try:
             sent = await client.send_cached_media(user.id, row["file_id"], caption=caption, reply_markup=kb)
         except Exception as e:
             log.warning("Could not send via file_id (%s), trying to copy from the channel", e)
+            if errors is not None:
+                errors.append(f"send_cached_media: {type(e).__name__}: {e}")
 
     # 2) Fallback: copy from the DB channel
     if not sent:
@@ -2102,6 +2485,8 @@ async def send_file(client: Client, user, lang: str, msg_id: int):
             sent = await client.copy_message(user.id, DB_CHANNEL, msg_id, caption=caption, reply_markup=kb)
         except Exception as e:
             log.error("Error while sending file: %s", e)
+            if errors is not None:
+                errors.append(f"copy_message: {type(e).__name__}: {e}")
             return None
 
     log_file_sent(user, title, size)
@@ -2120,6 +2505,7 @@ async def deliver_pending(client: Client, user, chat_id: int, lang: str) -> bool
 
 
 @app.on_callback_query(filters.regex(r"^get\|"))
+@safe
 async def get_cb(client: Client, cq: CallbackQuery):
     lang = await lang_of(cq.from_user)
     missing = await not_joined(client, cq.from_user.id)
@@ -2191,6 +2577,13 @@ async def set_menu_commands():
         BotCommand("setstart", "Set start image"),
         BotCommand("delstart", "Remove start image"),
         BotCommand("admins", "List admins"),
+        BotCommand("diag", "Check why files are not sending"),
+        BotCommand("logs", "Send the logs to the log group"),
+        BotCommand("ban", "Ban a user"),
+        BotCommand("unban", "Unban a user"),
+        BotCommand("ping", "Is the bot alive?"),
+        BotCommand("addgroup", "Allow users in a group"),
+        BotCommand("groups", "List groups"),
         BotCommand("sent", "Send a message/file to a user"),
     ]
     owner_cmds = admin_cmds + [
@@ -2217,6 +2610,10 @@ async def main():
     if hasattr(store, "notify"):
         store.notify = notify_admins  # tells admins when a MongoDB gets full
     await load_admins()
+    DYNAMIC_GROUPS.update(
+        int(x) for x in (await store.get_meta("user_groups", "")).split() if x.lstrip("-").isdigit()
+    )
+    BANNED.update(int(x) for x in (await store.get_meta("banned", "")).split() if x.lstrip("-").isdigit())
     saved_db = await store.get_meta("db_channel", "")
     if saved_db.lstrip("-").isdigit():
         DB_CHANNEL = int(saved_db)  # channel chosen with /dbset wins over .env
