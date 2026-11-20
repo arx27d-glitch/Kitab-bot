@@ -197,21 +197,8 @@ GROUP_TEXT_SEARCH = env_bool("GROUP_TEXT_SEARCH", "true")
 # true = plain /start always shows the language buttons first (false = only the first time)
 ASK_LANGUAGE_ON_START = env_bool("ASK_LANGUAGE_ON_START", "true")
 
-# Railway / any host: tells exactly which required variable is empty
-_required = {
-    "API_ID": API_ID,
-    "API_HASH": API_HASH,
-    "BOT_TOKEN": BOT_TOKEN,
-    "DB_CHANNEL": DB_CHANNEL,
-    "ADMINS": ADMINS,
-}
-_missing = [k for k, v in _required.items() if not v]
-if _missing:
-    raise SystemExit(
-        "❌ Railway > Variables me ye values bharo: "
-        + ", ".join(_missing)
-        + "\n(railway.env paste karke sirf values daalo)"
-    )
+if not (API_ID and API_HASH and BOT_TOKEN and DB_CHANNEL):
+    raise SystemExit("API_ID, API_HASH, BOT_TOKEN and DB_CHANNEL are required (see .env).")
 
 app = Client(
     "bookbot",
