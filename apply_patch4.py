@@ -1,14 +1,21 @@
 """Kitab-bot TMDB fix (patch #4). Run AFTER apply_patch.py, apply_patch2.py and apply_patch3.py:
-   python apply_patch4.py
+   python apply_patch4.py            -> apply
+   python apply_patch4.py --check    -> only test if every anchor matches, change nothing
 Fixes: v4 token support, smarter title match (KGF = K.G.F), no caching of errors,
-poster is downloaded and uploaded (no URL problems), new admin command /tmdb for diagnosis.
-Edits bot.py only (backup: bot.py.bak4)."""
+poster is downloaded and uploaded (no URL problems), TMDB is paused for 5 minutes after an
+error (searches never get slow), new admin command /tmdb for diagnosis.
+Edits bot.py only (backup: bot.py.bak4).
+
+Safe: if a required anchor is missing, nothing is written and the problems are listed."""
 import os
 import re
 import shutil
 import sys
 
 NEW_SECTION = r'''# ---- TMDB poster (optional)  [v2]
+_tmdb_down_until = 0.0  # after a TMDB error the poster is skipped until this time (no slow searches)
+
+
 def _alnum(text: str) -> str:
     """'K.G.F: Chapter 2' -> 'kgfchapter2' (so KGF = K.G.F, Grey's = Greys)"""
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower().replace("'", ""))
@@ -87,15 +94,21 @@ async def tmdb_info(name: str, year: str = ""):
 
 async def send_results(m: Message, text: str, kb, query: str):
     """Results page. With TMDB_API_KEY the page is sent under the poster of the exact title."""
-    if TMDB_API_KEY:
+    global _tmdb_down_until
+    if TMDB_API_KEY and time.time() >= _tmdb_down_until:
+        info = None
         try:
             top = _top_title.get(" ".join(_words(query)))
-            info = None
             if top:
                 toks = _tokens(top)
                 year = next((t for t in toks if re.fullmatch(r"(?:19|20)\d\d", t)), "")
-                info = await tmdb_info(" ".join(_core(toks)), year)
-            if info:
+                info = await asyncio.wait_for(tmdb_info(" ".join(_core(toks)), year), 8)
+        except Exception as e:  # TMDB is down / key wrong: skip posters for 5 minutes
+            _tmdb_down_until = time.time() + 300
+            log.warning("TMDB lookup failed (%s: %s), posters paused for 5 minutes. Use /tmdb to check.",
+                        type(e).__name__, e)
+        if info:
+            try:
                 head = f"☆ <b>{esc(info['name'])}</b>"
                 if info["year"]:
                     head += f" ({esc(info['year'])})"
@@ -110,8 +123,8 @@ async def send_results(m: Message, text: str, kb, query: str):
                         log.warning("Could not download the poster (%s), sending its link", e)
                         photo = info["poster"]
                     return await m.reply_photo(photo, caption=caption, reply_markup=kb, quote=True)
-        except Exception as e:
-            log.warning("TMDB poster failed: %s: %s", type(e).__name__, e)
+            except Exception as e:
+                log.warning("Could not send the poster: %s: %s", type(e).__name__, e)
     return await m.reply(text, reply_markup=kb, quote=True)
 
 
@@ -119,6 +132,7 @@ async def send_results(m: Message, text: str, kb, query: str):
 @safe
 async def tmdb_cmd(client: Client, m: Message):
     """/tmdb Money Heist  ->  tells why the poster does or does not appear."""
+    global _tmdb_down_until
     import urllib.error
 
     name = m.text.split(None, 1)[1].strip() if len(m.command) > 1 else "Money Heist"
@@ -128,7 +142,11 @@ async def tmdb_cmd(client: Client, m: Message):
             "<code>TMDB_API_KEY</code>) and redeploy.",
             quote=True,
         )
+    was_paused = time.time() < _tmdb_down_until
+    _tmdb_down_until = 0.0  # a manual check also restarts the posters
     lines = [f"◇ Key type: <b>{_tmdb_kind()}</b> ({len(TMDB_API_KEY.strip())} characters)"]
+    if was_paused:
+        lines.append("◇ Posters were paused after an error, now switched on again.")
     try:
         data = await asyncio.to_thread(_tmdb_get, "/search/multi", {"query": name, "include_adult": "false"})
         results = data.get("results", [])
@@ -141,6 +159,11 @@ async def tmdb_cmd(client: Client, m: Message):
         pick = _tmdb_pick(results, name)
         if pick:
             lines.append(f"✓ Exact match: <b>{esc(pick.get('title') or pick.get('name'))}</b> → poster will be shown")
+            try:
+                size = len(await asyncio.to_thread(_fetch_bytes, "https://image.tmdb.org/t/p/w500" + pick["poster_path"]))
+                lines.append(f"✓ Poster download works ({size // 1024} KB)")
+            except Exception as e:
+                lines.append(f"✗ Poster download failed: {esc(type(e).__name__)}: {esc(e)}")
         else:
             lines.append("✗ No result has exactly this title, so the bot sends the plain text page (by design).")
     except urllib.error.HTTPError as e:
@@ -154,12 +177,8 @@ async def tmdb_cmd(client: Client, m: Message):
 '''
 
 
-def sub(s, old, new, label):
-    assert s.count(old) == 1, f"anchor not found (or not unique): {label}"
-    return s.replace(old, new, 1)
-
-
 def main():
+    check_only = "--check" in sys.argv
     if not os.path.exists("bot.py"):
         sys.exit("bot.py not found. Run this script inside the Kitab-bot folder.")
     with open("bot.py", encoding="utf-8") as f:
@@ -167,16 +186,47 @@ def main():
     if "def tmdb_cmd" in s:
         print("bot.py: already patched, skipped")
         return
-    assert "def _words(" in s and "def notify_requesters" in s, "Run apply_patch.py, apply_patch2.py and apply_patch3.py first."
 
-    s, n = re.subn(r"# ---- TMDB poster \(optional\)\n.*?(?=async def build_page\()", lambda m: NEW_SECTION, s, count=1, flags=re.S)
-    assert n == 1, "TMDB section not found"
-    s = sub(s, 'r"mkv|mp4|avi|esub|esubs|sub|subs|nf|amzn|dl)$"',
-            'r"mkv|mp4|avi|esub|esubs|sub|subs|nf|amzn|dl|dubbed|dub|org|uncut|extended|proper|repack|remastered|imax|hq|hdtc|predvd)$"',
-            "meta words")
-    s = sub(s, '"ping", "trending",', '"ping", "trending", "tmdb",', "command exclusion list")
-    s = sub(s, '        BotCommand("ping", "Is the bot alive?"),',
-            '        BotCommand("ping", "Is the bot alive?"),\n        BotCommand("tmdb", "Check the TMDB poster setup"),', "menu")
+    errors, warns = [], []
+    if "def _words(" not in s:
+        errors.append("apply_patch3.py has not been applied (no _words in bot.py)")
+    if "def notify_requesters" not in s:
+        errors.append("apply_patch2.py has not been applied (no notify_requesters in bot.py)")
+
+    # 1) replace the old TMDB section (header may or may not carry a suffix)
+    s, n = re.subn(
+        r"# ---- TMDB poster \(optional\)[^\n]*\n.*?(?=async def build_page\()",
+        lambda m: NEW_SECTION, s, count=1, flags=re.S,
+    )
+    if n != 1:
+        errors.append("old TMDB section ('# ---- TMDB poster (optional)') not found before build_page")
+
+    # 2) /tmdb command: not a movie name + menu entry
+    for old, new, label, required in (
+        ('"ping", "trending",', '"ping", "trending", "tmdb",', "search_handler command exclusion list", True),
+        ('        BotCommand("ping", "Is the bot alive?"),',
+         '        BotCommand("ping", "Is the bot alive?"),\n        BotCommand("tmdb", "Check the TMDB poster setup"),',
+         "admin menu", False),
+        ('r"mkv|mp4|avi|esub|esubs|sub|subs|nf|amzn|dl)$"',
+         'r"mkv|mp4|avi|esub|esubs|sub|subs|nf|amzn|dl|dubbed|dub|org|uncut|extended|proper|repack|remastered|imax|hq|hdtc|predvd)$"',
+         "extra release words (_core)", False),
+    ):
+        count = s.count(old)
+        if count == 1:
+            s = s.replace(old, new, 1)
+        else:
+            (errors if required else warns).append(f"{label} (found {count} times, need exactly 1)")
+
+    if errors:
+        print("NOTHING was changed. Problems:")
+        for e in errors:
+            print("  x", e)
+        sys.exit(1)
+    for w in warns:
+        print("  (optional part skipped)", w)
+    if check_only:
+        print("OK: every required anchor matches. Run again without --check to apply.")
+        return
 
     shutil.copyfile("bot.py", "bot.py.bak4")
     with open("bot.py", "w", encoding="utf-8", newline="\n") as f:
