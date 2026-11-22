@@ -77,6 +77,8 @@ T["en"] = dict(
     a_filesent="File sent", a_filefail="Couldn't get the file, please try again later.",
     a_joinfirst="Please join all the channels first!", a_closefail="Couldn't close this.",
     lang_title="Choose your language", lang_set="Language changed to {lang}",
+    a_requsage="Usage: /request Movie Name",
+    a_requested="Your request was sent to the team. We will add it soon if possible.",
 )
 
 T["hi"] = dict(
@@ -108,6 +110,8 @@ T["hi"] = dict(
     a_filesent="फ़ाइल भेज दी गई", a_filefail="फ़ाइल नहीं मिल पाई, कृपया बाद में कोशिश करें।",
     a_joinfirst="पहले सभी चैनल जॉइन करें!", a_closefail="इसे बंद नहीं कर सका।",
     lang_title="अपनी भाषा चुनें", lang_set="भाषा बदलकर {lang} कर दी गई",
+    a_requsage="इस्तेमाल: /request मूवी का नाम",
+    a_requested="आपकी रिक्वेस्ट टीम को भेज दी गई है। हो सका तो जल्दी ही जोड़ दी जाएगी।",
 )
 
 T["fa"] = dict(
@@ -700,7 +704,6 @@ T["sv"] = dict(
 )
 
 
-
 # text shown when someone taps a file in a group but the bot may not write to him yet
 _START_BOT = {
     "en": "Open the bot, press Start, then tap the file again.",
@@ -784,6 +787,7 @@ _DELETED = {
 for _code, (_gone, _again) in _DELETED.items():
     T[_code]["a_deleted"] = _gone
     T[_code]["b_again"] = _again
+
 
 class _Safe(dict):
     def __missing__(self, key):

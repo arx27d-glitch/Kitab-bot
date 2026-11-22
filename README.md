@@ -1,71 +1,43 @@
-# 🎬 MOVIE Bot (Telegram)
+# 🎬 MOVIE Bot (Telegram) — Advanced
 
-Ek Telegram bot jo Movie/Series ka **naam** bhejne par file dhoond kar bhej deta hai.
+Movie/Series ka **naam** bhejo, bot file dhoond kar bhej deta hai.
 
 ## Features
-- 4 channel **force-join** (zarurat ho to 10 tak badha sakte ho)
-- `/start`, `/help` commands
-- File bhejne ke **5 minute baad auto-delete** (time env se change hota hai)
-- Naam se search + pagination buttons
-- Admin commands: `/stats`, `/broadcast`
-- Sab settings environment variables se
+- **Exact search**: poore shabd se match ("Money Heist" ke saath "Money Talks" nahi aata, "man" se "Batman" nahi aata). Symbols (`: , ! ? '`) ignore hote hain.
+- Spelling-tolerant search (salam = salaam), Hindi/Tamil/Telugu... naam bhi (Latin me convert hokar)
+- Duplicate files (same naam + size) result me sirf ek baar
+- Quality / language / season filter buttons + pagination
+- 4 se 10 **force-join** channels (`CHANNEL_1` ... `CHANNEL_10`, ya `/addchannel`)
+- 21 languages, `/start` par language choose
+- File bhejne ke baad **auto-delete** (default 5 min) + "request again" button
+- `/request naam` — file na mile to user request bhej sakta hai (auto-reply group me card aata hai)
+- DB channel ki files auto-index, group se auto-forward (`SOURCE_GROUPS`)
+- Group me bhi kaam karta hai (bot admin ho to); group ki normal chat se fake "movie request" nahi banti
+- Multi-MongoDB (`MONGO_URI`, `MONGO_URI_1` ... `MONGO_URI_10`), flood protection, ban/unban
+- Admin: `/stats /broadcast /index /addchannel /delchannel /channels /setstart /delstart /admins /diag /logs /ban /unban /banned /ping /sent`
+- Owner: `/addadmin /deladmin /del /dbset`
 
-> ⚠️ Is bot me sirf wahi files daalo jinke rights tumhare paas hain (apni files, public domain, free/legal content).
+> ⚠️ Sirf wahi files daalo jinke rights tumhare paas hain.
 
 ## Setup
-
-1. **Bot banao**: @BotFather se token lo.
-2. **API ID / HASH**: https://my.telegram.org se lo.
-3. **DB channel banao** (private) aur bot ko usme **admin** banao. Isme saari kitabon ki files post karo. Bot unhe apne aap index kar lega.
-4. **4 force-join channels** me bhi bot ko **admin** banao (warna join check nahi hoga).
-5. `.env.example` ko copy karke `.env` banao aur sab values bharo:
-
-```bash
-cp .env.example .env
-```
-
-| Variable | Matlab |
-|---|---|
-| `API_ID`, `API_HASH` | my.telegram.org se |
-| `BOT_TOKEN` | @BotFather se |
-| `DB_CHANNEL` | Files wale channel ka id (`-100...`) |
-| `ADMINS` | Admin user ids (space se alag) |
-| `CHANNEL_1` ... `CHANNEL_4` | Force-join channel (`@username` ya `-100...` id) |
-| `CHANNEL_n_LINK` | Private channel ka invite link |
-| `AUTO_DELETE_SECONDS` | `300` = 5 minute, `0` = band |
-| `BOT_NAME`, `OWNER_USERNAME`, `SUPPORT_USERNAME`, `UPDATES_CHANNEL` | Buttons aur naam |
-| `START_TEXT`, `JOIN_TEXT` | Messages badalne ke liye (optional) |
+1. @BotFather se bot token lo, https://my.telegram.org se API ID/HASH.
+2. Private **DB channel** banao, bot ko **admin** banao, files usme post karo.
+3. Force-join channels me bhi bot ko **admin** banao.
+4. `cp .env.example .env` karke values bharo (Railway par `railway.env` ke variables dashboard me daalo).
+5. **MONGO_URI zaroor do** (mongodb.com Atlas free), warna restart par data mit jayega.
 
 ## Run
-
 ```bash
 pip install -r requirements.txt
 python bot.py
 ```
+Docker: `docker build -t movie-bot . && docker run -d --env-file .env movie-bot`
 
-### Docker
-```bash
-docker build -t kitab-bot .
-docker run -d --env-file .env -v $(pwd)/data:/data -e DB_PATH=/data/files.db kitab-bot
-```
+Railway: repo connect karo, variables daalo (`railway.json` pehle se hai).
 
-### Heroku / Railway / Render / VPS
-Repo connect karo aur dashboard me upar wale environment variables daalo. Start command: `python bot.py`
-
-## GitHub par upload
-
-```bash
-git init
-git add .
-git commit -m "Kitab bot"
-git branch -M main
-git remote add origin https://github.com/<username>/<repo>.git
-git push -u origin main
-```
-
-`.env` aur `*.session` file `.gitignore` me hain, isliye tumhare token/secrets GitHub par **nahi** jayenge. Kabhi `.env` commit mat karna.
-
-## Dhyan rakhne wali baatein
-- Auto-delete bot chalu rehne tak hi kaam karta hai. Restart par pending delete timers reset ho jate hain.
-- Bot start karne se pehle jo files DB channel me thi, wo index nahi hongi. Unhe dobara post/forward karo.
-- Agar kisi force-join channel me bot admin nahi hai, to bot log me error dega aur us channel ko skip kar dega.
+## Important
+- Purani files ka search-text purane format me hai. Naya exact search unpar bhi chalta hai, par best result ke liye ek baar **`/index full`** chala do.
+- `pyrotgfork==2.2.24.1` install na ho to `requirements.txt` me sirf `pyrotgfork` likh do.
+- `FILE_TAG` default `[@OVN3RS]` hai — apna tag daalo ya khali chhodo.
+- `.env` aur `*.session` kabhi commit mat karo.
+- Kuch na chale to admin se `/diag` chalao.

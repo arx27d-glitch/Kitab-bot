@@ -2,6 +2,8 @@
 
 MongoStore  -> MongoDB (restart ke baad bhi data bacha rehta hai, RECOMMENDED)
 SqliteStore -> local file (sirf test / VPS ke liye; Heroku/Railway/Render par restart me mit sakti hai)
+
+Search = WHOLE WORDS (word-start match): "man" finds "Man of Steel" but NOT "Batman".
 """
 import asyncio
 import logging
@@ -13,8 +15,12 @@ log = logging.getLogger("bookbot.storage")
 
 
 def _like(word: str) -> str:
-    """LIKE pattern for a word; % and _ typed by a user are NOT wildcards."""
-    return "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    """LIKE pattern: the word must START a word of the search text. % and _ typed by a user are NOT wildcards."""
+    return "% " + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _regex(word: str) -> dict:
+    return {"$regex": r"(?:^|\s)" + re.escape(word)}
 
 
 class SqliteStore:
@@ -63,22 +69,23 @@ class SqliteStore:
         return cur.rowcount
 
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
+        """Every word must be found (at the start of a word)."""
         if not words:
             return []
         sql = (
             "SELECT msg_id, title, size FROM files WHERE "
-            + " AND ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
+            + " AND ".join(["(' ' || search) LIKE ? ESCAPE '\\'"] * len(words))
             + " ORDER BY title LIMIT 2000"
         )
         return [tuple(r) for r in self.db.execute(sql, [_like(w) for w in words]).fetchall()]
 
     async def find_any(self, words: List[str], limit: int = 200) -> List[Tuple[int, str, int]]:
-        """Kam se kam ek word match kare; jyada words match wale pehle."""
+        """At least one word matches; files with more matching words come first."""
         if not words:
             return []
         like = [_like(w) for w in words]
-        score = " + ".join(["(search LIKE ? ESCAPE '\\')"] * len(words))
-        where = " OR ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
+        score = " + ".join(["((' ' || search) LIKE ? ESCAPE '\\')"] * len(words))
+        where = " OR ".join(["(' ' || search) LIKE ? ESCAPE '\\'"] * len(words))
         sql = (
             f"SELECT msg_id, title, size FROM files WHERE {where} "
             f"ORDER BY ({score}) DESC, title LIMIT {int(limit)}"
@@ -181,24 +188,25 @@ class MongoStore:
         return res.deleted_count
 
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
+        """Every word must be found (at the start of a word)."""
         if not words:
             return []
-        conds = [{"search": {"$regex": re.escape(w)}} for w in words]
+        conds = [{"search": _regex(w)} for w in words]
         cur = self.db.files.find({"$and": conds}, {"title": 1, "size": 1}).sort("title", 1)
         docs = await cur.to_list(length=2000)
         return [(d["_id"], d.get("title", ""), d.get("size", 0)) for d in docs]
 
     async def find_any(self, words: List[str], limit: int = 200) -> List[Tuple[int, str, int]]:
-        """Kam se kam ek word match kare; jyada words match wale pehle."""
+        """At least one word matches; files with more matching words come first."""
         if not words:
             return []
-        conds = [{"search": {"$regex": re.escape(w)}} for w in words]
+        conds = [{"search": _regex(w)} for w in words]
         cur = self.db.files.find({"$or": conds}, {"title": 1, "size": 1, "search": 1}).limit(1000)
         docs = await cur.to_list(length=1000)
 
         def score(d):
-            text = d.get("search", "")
-            return sum(1 for w in words if w in text)
+            text = " " + d.get("search", "")
+            return sum(1 for w in words if " " + w in text)
 
         docs.sort(key=lambda d: (-score(d), d.get("title", "")))
         return [(d["_id"], d.get("title", ""), d.get("size", 0)) for d in docs[:limit]]
@@ -434,8 +442,8 @@ class MultiMongoStore:
         merged = await self._all(lambda st: st.find_any(words, limit))
 
         def score(r):
-            t = (r[1] or "").lower()
-            return sum(1 for w in words if w in t)
+            t = " " + (r[1] or "").lower()
+            return sum(1 for w in words if " " + w in t)
 
         merged.sort(key=lambda r: (-score(r), r[1]))
         return merged[:limit]
