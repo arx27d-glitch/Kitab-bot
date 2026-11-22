@@ -49,15 +49,19 @@ def main():
 
     s, n = re.subn(r"def _tokens\(title: str\):.*?\n\n\n", lambda m: NEW_TOKENS, s, count=1, flags=re.S)
     assert n == 1, "_tokens not found"
-    s = sub(s, '        if core == q:', '        if core == q or "".join(core) == "".join(q):', "strict_filter tier 1")
-    s = sub(s, "    words = norm(query).split()\n    latin = to_latin(query)\n    lwords = norm(latin).split() if latin != query else words\n",
-            "    words = norm(query).split()\n    lwords = _words(query)\n", "run_search words")
+    s = sub(s, "        if core == q:", '        if core == q or "".join(core) == "".join(q):', "strict_filter tier 1")
+    s = sub(
+        s,
+        "    words = norm(query).split()\n    latin = to_latin(query)\n    lwords = norm(latin).split() if latin != query else words\n",
+        "    words = norm(query).split()\n    lwords = _words(query)\n",
+        "run_search words",
+    )
     s = sub(s, "    latin = to_latin(query)\n    lw = norm(latin).split()\n", "    lw = _words(query)\n", "suggest_names")
     s = sub(s, "\n    # typo tolerance:", "\n" + SECOND_CHANCE, "run_search second chance")
+
     old = '" ".join(norm(to_latin(query)).split())'
     assert s.count(old) >= 1, "query key not found"
     s = s.replace(old, '" ".join(_words(query))')
-    s = s.replace("key = \" \".join(norm(to_latin(query)).split())", "key = \" \".join(_words(query))")
 
     shutil.copyfile("bot.py", "bot.py.bak3")
     with open("bot.py", "w", encoding="utf-8", newline="\n") as f:
