@@ -1,7 +1,11 @@
 """Kitab-bot feature patch #2 (run AFTER apply_patch.py, inside the repo folder):
-   python apply_patch2.py
+   python apply_patch2.py            -> apply
+   python apply_patch2.py --check    -> only test if every anchor matches, change nothing
 Adds: duplicate hiding, /trending, "Notify me" requests, daily file limit, TMDB poster.
-Edits bot.py, i18n.py, .env.example, railway.env (backups saved as *.bak2)."""
+Edits bot.py, i18n.py, .env.example, railway.env (backups saved as *.bak2).
+
+Safe: all changes are prepared in memory first. If ANY required anchor is missing,
+nothing is written and the full list of problems is printed."""
 import os
 import shutil
 import sys
@@ -56,6 +60,15 @@ def _bg(coro):
     task = asyncio.create_task(coro)
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+
+
+async def _lang_for(uid: int) -> str:
+    """Language of a user who is not talking to the bot right now."""
+    lg = _user_lang.get(uid)
+    if lg:
+        return lg
+    saved = await store.get_meta(f"lang:{uid}", "")
+    return saved if saved in LANGS else "en"
 
 
 # ---- daily limit
@@ -148,11 +161,8 @@ async def notify_requesters(title: str):
     for k in hits:
         for uid in _requests.pop(k, []):
             try:
-                await app.send_message(
-                    uid,
-                    "🔔 " + tr(_user_lang.get(uid, "en"), "nt_found", name=esc(name)),
-                    link_preview_options=NO_PREVIEW,
-                )
+                text = "🔔 " + tr(await _lang_for(uid), "nt_found", name=esc(name))
+                await app.send_message(uid, text, link_preview_options=NO_PREVIEW)
             except FloodWait as e:
                 await asyncio.sleep(e.value + 1)
             except Exception:
@@ -235,8 +245,33 @@ T["en"]["nt_dup"] = "You already requested this (or your request list is full)."
 T["en"]["nt_found"] = "Good news! <b>{name}</b> is now available. Send its name to the bot."
 T["en"]["daily_limit"] = "Daily limit reached: {n} files per day. Please try again tomorrow."
 
+T["hi"]["trend_title"] = "ट्रेंडिंग सर्च"
+T["hi"]["trend_none"] = "अभी तक कोई सर्च नहीं हुआ।"
+T["hi"]["nt_btn"] = "उपलब्ध होने पर बताएँ"
+T["hi"]["nt_ok"] = "हो गया! फ़ाइल जुड़ते ही मैं आपको मैसेज करूँगा।"
+T["hi"]["nt_dup"] = "आप पहले ही माँग चुके हैं (या आपकी लिस्ट भरी हुई है)।"
+T["hi"]["nt_found"] = "खुशखबरी! <b>{name}</b> अब उपलब्ध है। बॉट को उसका नाम भेजें।"
+T["hi"]["daily_limit"] = "डेली लिमिट पूरी हो गई: एक दिन में {n} फ़ाइलें। कृपया कल फिर कोशिश करें।"
+
 
 '''
+
+
+class Patch:
+    """Collects every anchor problem instead of stopping at the first one."""
+
+    def __init__(self, text):
+        self.s = text
+        self.errors = []
+        self.warns = []
+
+    def sub(self, old, new, label, required=True):
+        n = self.s.count(old)
+        if n == 1:
+            self.s = self.s.replace(old, new, 1)
+            return True
+        (self.errors if required else self.warns).append(f"{label} (found {n} times, need exactly 1)")
+        return False
 
 
 def read(p):
@@ -250,113 +285,136 @@ def write(p, s):
         f.write(s)
 
 
-def sub(s, old, new, label):
-    assert s.count(old) == 1, f"anchor not found (or not unique): {label}"
-    return s.replace(old, new, 1)
-
-
-def patch_bot():
+def build_bot():
+    """Returns (new_text or None if already patched, errors, warns)."""
     s = read("bot.py")
     if "def notify_requesters" in s:
-        print("bot.py: already patched, skipped")
-        return
-    assert "def strict_filter" in s, "Run apply_patch.py first."
+        return None, [], []
+    if "def strict_filter" not in s:
+        return None, ["bot.py has no strict_filter: run apply_patch.py first"], []
+    p = Patch(s)
 
-    s = sub(s, "async def build_page(query: str, page: int, token: str, lang: str = \"en\", group_links: bool = False):",
-            BLOCK + "async def build_page(query: str, page: int, token: str, lang: str = \"en\", group_links: bool = False):",
-            "build_page")
+    p.sub('async def build_page(query: str, page: int, token: str, lang: str = "en", group_links: bool = False):',
+          BLOCK + 'async def build_page(query: str, page: int, token: str, lang: str = "en", group_links: bool = False):',
+          "build_page definition")
 
     # duplicates + remember the best title
-    s = sub(s, "    results = strict_filter(lwords, cand) if STRICT_SEARCH else cand\n    if results:\n        return results, False",
-            "    results = strict_filter(lwords, cand) if STRICT_SEARCH else cand\n    results = dedupe(results)\n"
-            "    if results:\n        if len(_top_title) > 3000:\n            _top_title.clear()\n"
-            "        _top_title[\" \".join(lwords)] = results[0][1]\n        return results, False",
-            "run_search strict")
-    s = sub(s, "        results = phonetic_rank(lwords, candidates, min_ratio=0.84, require_all=True)\n        if results:",
-            "        results = dedupe(phonetic_rank(lwords, candidates, min_ratio=0.84, require_all=True))\n        if results:",
-            "run_search fuzzy")
+    p.sub("    results = strict_filter(lwords, cand) if STRICT_SEARCH else cand\n    if results:\n        return results, False",
+          "    results = strict_filter(lwords, cand) if STRICT_SEARCH else cand\n    results = dedupe(results)\n"
+          "    if results:\n        if len(_top_title) > 3000:\n            _top_title.clear()\n"
+          "        _top_title[\" \".join(lwords)] = results[0][1]\n        return results, False",
+          "run_search strict block")
+    p.sub("        results = phonetic_rank(lwords, candidates, min_ratio=0.84, require_all=True)\n        if results:",
+          "        results = dedupe(phonetic_rank(lwords, candidates, min_ratio=0.84, require_all=True))\n        if results:",
+          "run_search fuzzy block")
 
     # "Notify me" button on not-found
-    s = sub(s, "        rows = []\n        if SUPPORT_USERNAME:\n            rows.append([btn(f\"♡ {tr(lang, 'b_support')}\", BLUE, url=f\"https://t.me/{SUPPORT_USERNAME}\")])",
-            "        rows = []\n        if REQUEST_NOTIFY:\n            rows.append([btn(f\"🔔 {tr(lang, 'nt_btn')}\", GREEN, callback_data=f\"nt|{token}\")])\n"
-            "        if SUPPORT_USERNAME:\n            rows.append([btn(f\"♡ {tr(lang, 'b_support')}\", BLUE, url=f\"https://t.me/{SUPPORT_USERNAME}\")])",
-            "not-found rows")
+    p.sub("        rows = []\n        if SUPPORT_USERNAME:\n            rows.append([btn(f\"♡ {tr(lang, 'b_support')}\", BLUE, url=f\"https://t.me/{SUPPORT_USERNAME}\")])",
+          "        rows = []\n        if REQUEST_NOTIFY:\n            rows.append([btn(f\"🔔 {tr(lang, 'nt_btn')}\", GREEN, callback_data=f\"nt|{token}\")])\n"
+          "        if SUPPORT_USERNAME:\n            rows.append([btn(f\"♡ {tr(lang, 'b_support')}\", BLUE, url=f\"https://t.me/{SUPPORT_USERNAME}\")])",
+          "not-found button rows")
 
     # results with poster + trending count
-    s = sub(s, "    reply = await m.reply(text, reply_markup=kb, quote=True)\n    schedule_delete(reply, m)",
-            "    note_search(query)\n    reply = await send_results(m, text, kb, query)\n    schedule_delete(reply, m)",
-            "do_search tail")
+    p.sub("    reply = await m.reply(text, reply_markup=kb, quote=True)\n    schedule_delete(reply, m)",
+          "    note_search(query)\n    reply = await send_results(m, text, kb, query)\n    schedule_delete(reply, m)",
+          "do_search end")
 
     # /trending must not be treated as a movie name + menu entry
-    s = sub(s, '"banned", "ping",', '"banned", "ping", "trending",', "command exclusion list")
-    s = sub(s, '        BotCommand("search", "Search a movie: /search name"),',
-            '        BotCommand("search", "Search a movie: /search name"),\n        BotCommand("trending", "Most searched movies"),',
-            "menu commands")
+    p.sub('"banned", "ping",', '"banned", "ping", "trending",', "search_handler command exclusion list")
+    p.sub('        BotCommand("search", "Search a movie: /search name"),',
+          '        BotCommand("search", "Search a movie: /search name"),\n        BotCommand("trending", "Most searched movies"),',
+          "menu commands", required=False)
 
-    # notify requesters when a file is indexed
-    s = sub(s, '    log.info("Indexed: %s", title)\n    return True',
-            '    try:\n        await notify_requesters(title)\n    except Exception as e:\n        log.warning("notify_requesters failed: %s", e)\n'
-            '    log.info("Indexed: %s", title)\n    return True',
-            "index_message")
+    # notify requesters when a file is indexed (in the background, so a scan is not slowed down)
+    p.sub('    log.info("Indexed: %s", title)\n    return True',
+          '    if _requests:\n        _bg(notify_requesters(title))\n    log.info("Indexed: %s", title)\n    return True',
+          "index_message end")
 
     # daily limit
-    s = sub(s, "    log_file_sent(user, title, size)\n    schedule_file_delete(",
-            "    log_file_sent(user, title, size)\n    count_file(user.id)\n    schedule_file_delete(", "send_file count")
-    s = sub(s, "    if msg_id is None:\n        return False\n    if not await send_file(client, user, lang, msg_id):",
-            "    if msg_id is None:\n        return False\n    if over_limit(user.id):\n"
-            "        await client.send_message(chat_id, \"▲ \" + tr(lang, \"daily_limit\", n=DAILY_LIMIT))\n        return True\n"
-            "    if not await send_file(client, user, lang, msg_id):", "deliver_pending")
-    s = sub(s, "    msg_id = int(cq.data.split(\"|\")[1])\n    if not await send_file(client, cq.from_user, lang, msg_id):\n        return await cq.answer(tr(lang, \"a_filefail\"), show_alert=True)",
-            "    msg_id = int(cq.data.split(\"|\")[1])\n    if over_limit(cq.from_user.id):\n"
-            "        return await cq.answer(tr(lang, \"daily_limit\", n=DAILY_LIMIT), show_alert=True)\n"
-            "    if not await send_file(client, cq.from_user, lang, msg_id):\n        return await cq.answer(tr(lang, \"a_filefail\"), show_alert=True)",
-            "again_cb")
-    s = sub(s, "    msg_id = int(cq.data.split(\"|\")[1])\n    if not await send_file(client, cq.from_user, lang, msg_id):\n        if cq.message.chat.id < 0 and BOT_USERNAME:",
-            "    msg_id = int(cq.data.split(\"|\")[1])\n    if over_limit(cq.from_user.id):\n"
-            "        return await cq.answer(tr(lang, \"daily_limit\", n=DAILY_LIMIT), show_alert=True)\n"
-            "    if not await send_file(client, cq.from_user, lang, msg_id):\n        if cq.message.chat.id < 0 and BOT_USERNAME:",
-            "get_cb")
+    p.sub("    log_file_sent(user, title, size)\n    schedule_file_delete(",
+          "    log_file_sent(user, title, size)\n    count_file(user.id)\n    schedule_file_delete(", "send_file counter")
+    p.sub("    if msg_id is None:\n        return False\n    if not await send_file(client, user, lang, msg_id):",
+          "    if msg_id is None:\n        return False\n    if over_limit(user.id):\n"
+          "        await client.send_message(chat_id, \"▲ \" + tr(lang, \"daily_limit\", n=DAILY_LIMIT))\n        return True\n"
+          "    if not await send_file(client, user, lang, msg_id):", "deliver_pending")
+    p.sub("    msg_id = int(cq.data.split(\"|\")[1])\n    if not await send_file(client, cq.from_user, lang, msg_id):\n        return await cq.answer(tr(lang, \"a_filefail\"), show_alert=True)",
+          "    msg_id = int(cq.data.split(\"|\")[1])\n    if over_limit(cq.from_user.id):\n"
+          "        return await cq.answer(tr(lang, \"daily_limit\", n=DAILY_LIMIT), show_alert=True)\n"
+          "    if not await send_file(client, cq.from_user, lang, msg_id):\n        return await cq.answer(tr(lang, \"a_filefail\"), show_alert=True)",
+          "again_cb")
+    p.sub("    msg_id = int(cq.data.split(\"|\")[1])\n    if not await send_file(client, cq.from_user, lang, msg_id):\n        if cq.message.chat.id < 0 and BOT_USERNAME:",
+          "    msg_id = int(cq.data.split(\"|\")[1])\n    if over_limit(cq.from_user.id):\n"
+          "        return await cq.answer(tr(lang, \"daily_limit\", n=DAILY_LIMIT), show_alert=True)\n"
+          "    if not await send_file(client, cq.from_user, lang, msg_id):\n        if cq.message.chat.id < 0 and BOT_USERNAME:",
+          "get_cb")
 
-    # load saved data at startup
-    s = sub(s, "    _known_users.update(await store.all_user_ids())\n    await app.start()",
-            "    _known_users.update(await store.all_user_ids())\n    await load_extras()\n    await app.start()", "main")
+    # load saved data at startup, save it on shutdown
+    p.sub("    _known_users.update(await store.all_user_ids())\n    await app.start()",
+          "    _known_users.update(await store.all_user_ids())\n    await load_extras()\n    await app.start()", "main startup")
+    p.sub("    await idle()\n    await app.stop()", "    await idle()\n    await save_extras()\n    await app.stop()",
+          "main shutdown", required=False)
+    return p.s, p.errors, p.warns
 
-    write("bot.py", s)
-    print("bot.py: patched")
 
-
-def patch_i18n():
+def build_i18n():
     s = read("i18n.py")
     if "trend_title" in s:
-        print("i18n.py: already patched, skipped")
-        return
-    write("i18n.py", sub(s, "class _Safe(dict):", I18N + "class _Safe(dict):", "i18n"))
-    print("i18n.py: patched")
+        return None, []
+    p = Patch(s)
+    p.sub("class _Safe(dict):", I18N + "class _Safe(dict):", "i18n _Safe class")
+    return p.s, p.errors
 
 
-def patch_env(path):
+def build_env(path):
     if not os.path.exists(path):
-        return
+        return None
     s = read(path)
     if "DAILY_LIMIT" in s:
-        print(path + ": already updated, skipped")
-        return
+        return None
     if path.endswith(".env.example"):
         add = ("\n# ===== Extras =====\n# Files per user per day (IST). 0 = off\nDAILY_LIMIT=0\n"
                "# Poster + rating (free key from themoviedb.org). Empty = off\nTMDB_API_KEY=\n"
                "# 'Notify me' button when a movie is not found\nREQUEST_NOTIFY=true\n")
     else:
         add = "DAILY_LIMIT=0\nTMDB_API_KEY=\nREQUEST_NOTIFY=true\n"
-    write(path, s.rstrip("\n") + "\n" + add)
-    print(path + ": updated")
+    return s.rstrip("\n") + "\n" + add
 
 
-if __name__ == "__main__":
+def main():
+    check_only = "--check" in sys.argv
     for need in ("bot.py", "i18n.py"):
         if not os.path.exists(need):
             sys.exit(f"{need} not found. Run this script inside the Kitab-bot folder.")
-    patch_bot()
-    patch_i18n()
-    patch_env(".env.example")
-    patch_env("railway.env")
+
+    bot, bot_err, bot_warn = build_bot()
+    i18n, i18n_err = build_i18n()
+    errors = bot_err + i18n_err
+    if errors:
+        print("NOTHING was changed. These anchors did not match:")
+        for e in errors:
+            print("  x", e)
+        sys.exit(1)
+    for w in bot_warn:
+        print("  (optional part skipped)", w)
+
+    if check_only:
+        print("OK: every required anchor matches. Run again without --check to apply.")
+        return
+    if bot is None and i18n is None:
+        print("bot.py / i18n.py: already patched, skipped")
+    if bot is not None:
+        write("bot.py", bot)
+        print("bot.py: patched")
+    if i18n is not None:
+        write("i18n.py", i18n)
+        print("i18n.py: patched")
+    for path in (".env.example", "railway.env"):
+        env_text = build_env(path)
+        if env_text is not None:
+            write(path, env_text)
+            print(path + ": updated")
     print("Done. Now: git add . && git commit -m 'Extras' && git push")
+
+
+if __name__ == "__main__":
+    main()
