@@ -146,4 +146,6 @@ if __name__ == "__main__":
             "so the bot logs in with the token each time."
         )
     install_login_retry(bot.app)
-    bot.app.run(bot.main())
+    # PyroTGFork's app.run() no longer accepts a coroutine, so the loop is run directly
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(bot.main())
