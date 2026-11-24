@@ -44,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bookbot")
 IST = timezone(timedelta(hours=5, minutes=30))
 
+import buttonfix  # noqa: F401
 
 class RingHandler(logging.Handler):
     """Keeps the latest log lines in memory, so /logs can send them to the log group."""
