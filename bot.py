@@ -736,12 +736,37 @@ def plain_len(text: str) -> int:
     return len(re.sub(r"<[^>]+>", "", text or ""))
 
 
+def cq_chat_id(cq) -> int:
+    """Chat id of a button press. cq.message is None for old/inaccessible messages: use the user's DM."""
+    msg = getattr(cq, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    return chat.id if chat else cq.from_user.id
+
+
+async def cq_delete(cq):
+    """Deletes the message of a button press (nothing happens when the message is not accessible)."""
+    msg = getattr(cq, "message", None)
+    if msg is None:
+        return False
+    try:
+        await msg.delete()
+        return True
+    except Exception:
+        return False
+
+
+# buttons that still work when their message is gone (they only need the user, not the message)
+_NO_MESSAGE_OK = ("lg|", "again|", "get|", "recheck", "noop")
+
+
 async def edit(msg: Message, text: str, kb=None):
     """Edits a text message or a photo caption.
 
     A photo caption can only be 1024 characters long. When the new text is longer (for example
     the Help page of an admin) the photo message is replaced by a normal text message.
     """
+    if msg is None:  # old / inaccessible message (callback_query.message is None)
+        return
     has_media = bool(msg.photo or msg.video or msg.animation or msg.document)
     try:
         if has_media and plain_len(text) > 1024:
@@ -1253,14 +1278,11 @@ async def lang_cb(client: Client, cq: CallbackQuery):
         return await cq.answer()
     await set_lang(cq.from_user.id, code)
     await cq.answer(tr(code, "lang_set", lang=LANGS[code][0]))
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
+    await cq_delete(cq)
     pending = _pending_query.pop(cq.from_user.id, None)
     if pending:  # he had typed a movie name before choosing the language
         return await do_search(client, pending[0], pending[1])
-    await open_home(client, cq.message.chat.id, cq.from_user)
+    await open_home(client, cq_chat_id(cq), cq.from_user)
 
 
 @app.on_message(filters.command("help") & user_place)
@@ -1807,6 +1829,14 @@ async def ban_gate_message(_, m: Message):
 async def ban_gate_callback(_, cq: CallbackQuery):
     if cq.from_user.id in BANNED and cq.from_user.id not in ALL_ADMINS:
         await cq.answer("✗", show_alert=True)
+        raise StopPropagation
+    # Old button: Telegram no longer gives the message (cq.message is None). Handlers that need the
+    # message would crash, so the user just gets a short "expired" alert.
+    if cq.message is None and not (cq.data or "").startswith(_NO_MESSAGE_OK):
+        try:
+            await cq.answer(tr(await lang_of(cq.from_user), "a_expired"), show_alert=True)
+        except Exception:
+            pass
         raise StopPropagation
 
 
@@ -2959,6 +2989,8 @@ async def search_from_callback(client: Client, cq: CallbackQuery, query: str):
     lang = await lang_of(user)
     if flood_blocked(user.id):
         return
+    if cq.message is None:
+        return await cq.answer(tr(lang, "a_expired"), show_alert=True)
     if cq.message.chat.id > 0:
         missing = await not_joined(client, user.id)
         if missing:
@@ -3009,11 +3041,8 @@ async def recheck_cb(client: Client, cq: CallbackQuery):
         await edit(cq.message, text, kb)
         return
     await cq.answer("☆ " + tr(lang, "a_thanks"))
-    if await deliver_pending(client, cq.from_user, cq.message.chat.id, lang):
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
+    if await deliver_pending(client, cq.from_user, cq_chat_id(cq), lang):
+        await cq_delete(cq)
         return
     await show_home(client, cq, lang)
 
@@ -3022,12 +3051,9 @@ async def show_home(client: Client, cq: CallbackQuery, lang: str):
     """Welcome screen. If the start picture is set and the message is plain text (after Help), the
     picture is sent again."""
     pic = await store.get_meta("start_pic", "") or START_PIC
-    if pic and not cq.message.photo:
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
-        await send_welcome(client, cq.message.chat.id, cq.from_user, lang)
+    if cq.message is None or (pic and not cq.message.photo):
+        await cq_delete(cq)
+        await send_welcome(client, cq_chat_id(cq), cq.from_user, lang)
     else:
         await edit(cq.message, welcome_text(cq.from_user, lang), home_keyboard(lang))
 
@@ -3066,9 +3092,7 @@ async def noop_cb(_, cq: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^close$"))
 async def close_cb(_, cq: CallbackQuery):
-    try:
-        await cq.message.delete()
-    except Exception:
+    if not await cq_delete(cq):
         await cq.answer(tr(await lang_of(cq.from_user), "a_closefail"), show_alert=True)
         return
     await cq.answer()
@@ -3088,7 +3112,7 @@ async def filter_cb(client: Client, cq: CallbackQuery):
         sel.pop(kind)  # pressing the selected button again clears it
     else:
         sel[kind] = value
-    text, kb = await build_page(query, 0, token, await lang_of(cq.from_user), cq.message.chat.id < 0)
+    text, kb = await build_page(query, 0, token, await lang_of(cq.from_user), cq_chat_id(cq) < 0)
     if text:
         await edit(cq.message, text, kb)
     await cq.answer()
@@ -3101,7 +3125,7 @@ async def page_cb(client: Client, cq: CallbackQuery):
     query = _search_cache.get(token)
     if not query:
         return await cq.answer(tr(await lang_of(cq.from_user), "a_expired"), show_alert=True)
-    text, kb = await build_page(query, int(page), token, await lang_of(cq.from_user), cq.message.chat.id < 0)
+    text, kb = await build_page(query, int(page), token, await lang_of(cq.from_user), cq_chat_id(cq) < 0)
     if text:
         await edit(cq.message, text, kb)
     await cq.answer()
@@ -3204,10 +3228,7 @@ async def again_cb(client: Client, cq: CallbackQuery):
     if not await send_file(client, cq.from_user, lang, msg_id):
         return await cq.answer(tr(lang, "a_filefail"), show_alert=True)
     await cq.answer(f"□ {tr(lang, 'a_filesent')} ✓")
-    try:
-        await cq.message.delete()  # the notice is not needed any more
-    except Exception:
-        pass
+    await cq_delete(cq)  # the notice is not needed any more
 
 
 @app.on_callback_query(filters.regex(r"^get\|"))
@@ -3228,7 +3249,7 @@ async def get_cb(client: Client, cq: CallbackQuery):
 
     msg_id = int(cq.data.split("|")[1])
     if not await send_file(client, cq.from_user, lang, msg_id):
-        if cq.message.chat.id < 0 and BOT_USERNAME:  # pressed in a group, but the bot can't write to him
+        if cq_chat_id(cq) < 0 and BOT_USERNAME:  # pressed in a group, but the bot can't write to him
             return await cq.answer(
                 tr(lang, "a_startbot"), show_alert=True, url=f"https://t.me/{BOT_USERNAME}?start=go"
             )
@@ -3331,7 +3352,25 @@ async def main():
     if saved_db.lstrip("-").isdigit():
         DB_CHANNEL = int(saved_db)  # channel chosen with /dbset wins over .env
     _known_users.update(await store.all_user_ids())
-    await app.start()
+    # Telegram sometimes answers 500 RPC_CALL_FAIL while logging in: retry with a growing wait
+    for attempt in range(1, 13):
+        try:
+            await app.start()
+            break
+        except (FloodWait, RPCError, OSError, asyncio.TimeoutError) as e:
+            if isinstance(e, FloodWait):
+                wait = int(e.value) + 1
+            else:
+                wait = min(20 * 2 ** (attempt - 1), 300)
+            log.warning("Telegram login failed (%s: %s). Try %s/12, next try in %ss",
+                        type(e).__name__, e, attempt, wait)
+            if attempt == 12:
+                raise
+            try:
+                await app.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(wait)
     BOT_USERNAME = (await app.get_me()).username or ""
     await resolve_groups()
     _log_queue = asyncio.Queue(maxsize=2000)
