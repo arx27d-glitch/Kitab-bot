@@ -33,6 +33,8 @@ from pyrogram.types import (
 )
 
 from i18n import LANGS, detect_lang, tr
+import i18n_extra  # noqa: F401  (adds the texts of the new features to i18n)
+import moviedb
 from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
 from translit import phonetic_rank, to_latin
 from storage import MongoStore, MultiMongoStore, SqliteStore
@@ -75,7 +77,6 @@ if _log_file and _log_file.lower() != "off":  # also written to a file (1 MB x 3
     except Exception:
         pass
 START_TIME = time.time()
-SEARCHES = {"total": 0, "found": 0, "missed": 0}  # counters since the bot started (shown in /stats)
 
 
 # ----------------------------------------------------------------------------
@@ -89,22 +90,13 @@ def env_bool(name: str, default: str) -> bool:
     return env(name, default).lower() in ("1", "true", "yes")
 
 
-def env_int(name: str, default: int) -> int:
-    """Integer from env. A missing, empty or invalid value gives the default (never crashes)."""
-    try:
-        return int(env(name, str(default)) or default)
-    except ValueError:
-        return default
-
-
-API_ID = env_int("API_ID", 0)
+API_ID = int(env("API_ID", "0"))
 API_HASH = env("API_HASH")
 BOT_TOKEN = env("BOT_TOKEN")
-DB_CHANNEL = env_int("DB_CHANNEL", 0)
+DB_CHANNEL = int(env("DB_CHANNEL", "0"))
 ADMINS = [int(x) for x in env("ADMINS").replace(",", " ").split() if x.lstrip("-").isdigit()]
 # env wale ADMINS = owners. /addadmin se jude admin bhi yahan aa jate hain.
 ALL_ADMINS = set(ADMINS)
-
 
 # Database: provide MONGO_URI so data survives restarts (recommended)
 def load_mongo_uris():
@@ -119,7 +111,7 @@ def load_mongo_uris():
 
 
 MONGO_URIS = load_mongo_uris()
-MONGO_LIMIT_MB = env_int("MONGO_LIMIT_MB", 450)  # a database is "full" at this size
+MONGO_LIMIT_MB = int(env("MONGO_LIMIT_MB", "450") or 450)  # a database is "full" at this size
 MONGO_DB_NAME = env("MONGO_DB_NAME", "bookbot")
 DB_PATH = env("DB_PATH", "files.db")  # only used when MONGO_URI is not set
 
@@ -130,7 +122,7 @@ FORWARD_ALL = env_bool("FORWARD_ALL", "false")  # true = forward text messages t
 # Files in the DB channel get indexed as soon as the bot starts
 AUTO_INDEX_ON_START = env_bool("AUTO_INDEX_ON_START", "true")
 # If the bot can't post in the DB channel, give the last message id here for scanning
-DB_LAST_MESSAGE_ID = env_int("DB_LAST_MESSAGE_ID", 0)
+DB_LAST_MESSAGE_ID = int(env("DB_LAST_MESSAGE_ID", "0") or 0)
 
 BOT_NAME = env("BOT_NAME", "MOVIE HUB ☆ Bot")
 OWNER_USERNAME = env("OWNER_USERNAME").lstrip("@")
@@ -138,17 +130,36 @@ SUPPORT_USERNAME = env("SUPPORT_USERNAME").lstrip("@")
 UPDATES_CHANNEL = env("UPDATES_CHANNEL").lstrip("@")
 START_PIC = env("START_PIC")  # optional default welcome photo (admin can override with /setstart)
 
-AUTO_DELETE_SECONDS = env_int("AUTO_DELETE_SECONDS", 300)  # 300 = 5 minutes, 0 = off
-RESULTS_PER_PAGE = max(env_int("RESULTS_PER_PAGE", 8), 1)
+AUTO_DELETE_SECONDS = int(env("AUTO_DELETE_SECONDS", "300"))  # 300 = 5 minutes, 0 = off
+RESULTS_PER_PAGE = int(env("RESULTS_PER_PAGE", "8"))
+
+# ---- Movie info + poster (free APIs without a key, see moviedb.py. TMDB is not used any more)
+POSTER_ON_SEARCH = env_bool("POSTER_ON_SEARCH", "true")  # poster + rating on the search result page
+INFO_TIMEOUT = float(env("INFO_TIMEOUT", "3.5") or 3.5)  # seconds a search waits for the info API
+
+# ---- Search behaviour
+# true = if files with exactly the typed name exist ("Money Heist"), only those are shown (not "Money Heist Korea")
+EXACT_FIRST = env_bool("EXACT_FIRST", "true")
+# true = when nothing matches, also show files that contain only ONE of the typed words (looser, "related" results)
+FUZZY_SEARCH = env_bool("FUZZY_SEARCH", "false")
+
+# ---- Movie requests: how many pending requests one user may have
+REQUEST_LIMIT = int(env("REQUEST_LIMIT", "10") or 10)
+
+# ---- Premium plan (optional). Admins give it with /addpremium.
+# FREE_DAILY_LIMIT: files per day for free users (0 = unlimited for everybody)
+FREE_DAILY_LIMIT = int(env("FREE_DAILY_LIMIT", "0") or 0)
+PREMIUM_NO_AUTODELETE = env_bool("PREMIUM_NO_AUTODELETE", "true")  # premium users keep their files
+PREMIUM_SKIP_JOIN = env_bool("PREMIUM_SKIP_JOIN", "false")  # premium users don't need the force-join channels
 
 # Text added at the end of every file name (buttons + caption), before the extension. "" = off
 FILE_TAG = env("FILE_TAG", "[@OVN3RS]")
 # 0 = the tag is only shown in buttons/caption. A number (MB) = files up to this size are re-uploaded with
 # the new real file name (slower, uses bandwidth). Bigger files keep their name, the caption has the tag.
-RENAME_MAX_MB = env_int("RENAME_MAX_MB", 0)
+RENAME_MAX_MB = int(env("RENAME_MAX_MB", "0") or 0)
 # A user may do at most FLOOD_LIMIT searches in FLOOD_WINDOW seconds (admins are free). 0 = off
-FLOOD_LIMIT = env_int("FLOOD_LIMIT", 8)
-FLOOD_WINDOW = env_int("FLOOD_WINDOW", 20)
+FLOOD_LIMIT = int(env("FLOOD_LIMIT", "8") or 0)
+FLOOD_WINDOW = int(env("FLOOD_WINDOW", "20") or 20)
 
 # Optional: custom text. You can use {mention} {first_name} {bot_name} {minutes}
 START_TEXT_ENV = env("START_TEXT").replace("\\n", "\n")
@@ -260,12 +271,8 @@ def esc(text) -> str:
     return html.escape(str(text or ""), quote=False)
 
 
-_PUNCT = re.compile(r"[._\-\[\]\(\)\{\}:;,!?'\"’‘`&+@#/\\|~*=<>]+")
-
-
 def norm(text: str) -> str:
-    """Lower-case text where every punctuation mark is a space (used for the index AND for the query)."""
-    return _PUNCT.sub(" ", text or "").lower().strip()
+    return re.sub(r"[._\-\[\]\(\)]+", " ", text or "").lower().strip()
 
 
 def human(size) -> str:
@@ -451,21 +458,69 @@ async def register_user(user_id: int) -> bool:
     return is_new
 
 
-def now_ist() -> str:
-    return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+# ----------------------------------------------------------------------------
+# PREMIUM PLAN (optional): admins give it with /addpremium <user> <days>.
+# Perks (all configurable in .env): no daily download limit, files are not auto-deleted,
+# no flood limit, optionally no force-join. FREE_DAILY_LIMIT=0 means nobody has a daily limit.
+# ----------------------------------------------------------------------------
+PREMIUM: dict = {}  # user id -> unix time when the premium ends
+_usage: dict = {}  # user id -> (day, files sent that day)
+
+
+def is_premium(user_id: int) -> bool:
+    return PREMIUM.get(user_id, 0) > time.time()
+
+
+async def load_premium():
+    raw = await store.get_meta("premium", "")
+    for part in raw.split():
+        uid, _, until = part.partition(":")
+        if uid.isdigit() and until.isdigit():
+            PREMIUM[int(uid)] = float(until)
+
+
+async def save_premium():
+    now = time.time()
+    for uid in [u for u, until in PREMIUM.items() if until <= now]:
+        PREMIUM.pop(uid, None)  # expired plans are forgotten
+    await store.set_meta("premium", " ".join(f"{u}:{int(t)}" for u, t in sorted(PREMIUM.items())))
+
+
+def _today() -> str:
+    return datetime.now(IST).strftime("%Y%m%d")
+
+
+def downloads_today(user_id: int) -> int:
+    day, count = _usage.get(user_id, ("", 0))
+    return count if day == _today() else 0
+
+
+def count_download(user_id: int):
+    if len(_usage) > 20000:
+        _usage.clear()
+    _usage[user_id] = (_today(), downloads_today(user_id) + 1)
+
+
+def limit_reached(user_id: int) -> bool:
+    """True when a FREE user has used up today's downloads (admins and premium users never)."""
+    if FREE_DAILY_LIMIT <= 0 or user_id in ALL_ADMINS or is_premium(user_id):
+        return False
+    return downloads_today(user_id) >= FREE_DAILY_LIMIT
 
 
 async def log_start(client: Client, user, is_new: bool):
     """Sends a 'user started the bot' card to LOG_GROUP."""
     if not LOG_GROUP:
         return
+    ist = timezone(timedelta(hours=5, minutes=30))
+    when = datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
     text = (
         ("♡ <b>New User Started The Bot</b>\n" if is_new else "♧ <b>User Started The Bot</b>\n")
         + LINE
         + f"\n♧ Name: {user.mention}\n"
         f"¤ ID: <code>{user.id}</code>\n"
         f"◇ Username: {('@' + esc(user.username)) if user.username else 'none'}\n"
-        f"□ Time: {now_ist()}\n"
+        f"□ Time: {when}\n"
         f"☆ Total users: <b>{await store.count_users()}</b>\n"
         + LINE
     )
@@ -505,6 +560,11 @@ def group_text(chat, text: str):
         enqueue_group(lambda: app.send_message(chat, text, link_preview_options=NO_PREVIEW))
 
 
+def now_ist() -> str:
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
+
+
 def user_tag(user) -> str:
     uname = f"@{esc(user.username)}" if user.username else "no username"
     return f"♧ {user.mention} ┃ {uname}\n¤ ID: <code>{user.id}</code>"
@@ -536,25 +596,28 @@ def mirror_user_message(m: Message):
 _req_seen: dict = {}
 
 
-def log_movie_request(user, query: str, requested: bool = False):
-    """Movie not found -> card in the auto-reply group (same user + same name only once per 10 min)."""
+def log_movie_request(user, query: str, explicit: bool = False):
+    """Movie not found -> card in the auto-reply group (same user + same name only once per 10 min).
+
+    explicit=True: the user pressed the Request button / used /request (always logged)."""
     if not AUTO_GROUP:
         return
     key = (user.id, norm(query))
     now = time.time()
-    if now - _req_seen.get(key, 0) < 600:
+    if not explicit and now - _req_seen.get(key, 0) < 600:
         return
     _req_seen[key] = now
     if len(_req_seen) > 3000:
         for k in sorted(_req_seen, key=_req_seen.get)[:1500]:
             _req_seen.pop(k, None)
-    title = "☆ <b>Movie Request</b> ┃ ✓ <b>Asked With /request</b>" if requested else (
-        "☆ <b>Movie Request</b> ┃ ✗ <b>Not Available</b>"
+    head = (
+        "♤ <b>Movie Request</b> ┃ ✓ <b>Saved, the user gets a message when it is added</b>\n"
+        if explicit
+        else "☆ <b>Movie Request</b> ┃ ✗ <b>Not Available</b>\n"
     )
     group_text(
         AUTO_GROUP,
-        title
-        + "\n"
+        head
         + LINE
         + f"\n{user_tag(user)}\n"
         f"□ Requested: <i>{esc(query[:100])}</i>\n"
@@ -720,6 +783,12 @@ async def lang_of(user) -> str:
     return lg
 
 
+async def lang_of_id(user_id: int) -> str:
+    """Language of a user we only know by id (a saved choice, else English)."""
+    lg = _user_lang.get(user_id) or await store.get_meta(f"lang:{user_id}", "")
+    return lg if lg in LANGS else "en"
+
+
 async def has_chosen_lang(user_id: int) -> bool:
     return (await store.get_meta(f"lang:{user_id}", "")) in LANGS
 
@@ -756,14 +825,11 @@ def lang_keyboard():
 # ----------------------------------------------------------------------------
 def welcome_text(user, lang: str = "en") -> str:
     if START_TEXT_ENV:  # a custom text from .env is used for every language
-        return START_TEXT_ENV.format_map(
-            collections.defaultdict(
-                str,
-                mention=user.mention,
-                first_name=esc(user.first_name),
-                bot_name=esc(BOT_NAME),
-                minutes=minutes(),
-            )
+        return START_TEXT_ENV.format(
+            mention=user.mention,
+            first_name=esc(user.first_name),
+            bot_name=esc(BOT_NAME),
+            minutes=minutes(),
         )
     return (
         f"◇ <b>{esc(BOT_NAME)}</b> ◇\n"
@@ -772,6 +838,7 @@ def welcome_text(user, lang: str = "en") -> str:
         f"☆ {tr(lang, 'send_name')}\n\n"
         f"┏ ¤ <b>{tr(lang, 'f_search')}</b>\n"
         f"┣ □ <b>{tr(lang, 'f_delivery')}</b>\n"
+        f"┣ ★ <b>{tr(lang, 'f_info')}</b>\n"
         f"┗ ◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
         + LINE
         + f"\n♤ <i>{tr(lang, 'tip')}</i> <code>Coolie </code>"
@@ -790,9 +857,9 @@ def help_text(is_admin: bool, is_owner: bool = False, lang: str = "en") -> str:
         f"• {tr(lang, 'tip1')}\n"
         f"• {tr(lang, 'tip2')}\n"
         f"• {tr(lang, 'tip3')}\n"
-        f"• {tr(lang, 'tip4')} <code>KGF </code>\n"
-        f"• /request <code>name</code>"
+        f"• {tr(lang, 'tip4')} <code>KGF </code>"
     )
+    text += f"\n\n✦ <b>{tr(lang, 'cmds_title')}</b>\n" + LINE + "\n" + tr(lang, "help_cmds")
     if is_admin:  # admin / owner commands stay in English
         text += (
             "\n\n♛ <b>Admin Commands</b>\n"
@@ -806,11 +873,15 @@ def help_text(is_admin: bool, is_owner: bool = False, lang: str = "en") -> str:
             "/setstart - set the start image (send a photo with caption or reply to a photo)\n"
             "/delstart - remove the start image\n"
             "/admins - list admins\n"
-            "/diag - check the bot (database, channels, sending a test file)\n"
+            "/diag - check the bot (database, channels, movie info API, sending a test file)\n"
             "/logs - send the latest logs + all errors to the log group (<code>/logs 800</code>, <code>/logs errors</code>)\n"
             "/ban /unban /banned - block a user from the bot (reply, id or @username)\n"
             "/ping - is the bot alive\n"
-            "/sent - send a message/file to a user (<code>/sent user_id text</code>, or reply to a file)"
+            "/sent - send a message/file to a user (<code>/sent user_id text</code>, or reply to a file)\n"
+            "/addpremium - give premium (<code>/addpremium user_id 30</code> = 30 days, or reply to the user)\n"
+            "/delpremium - remove premium\n"
+            "/premiums - list premium users\n"
+            "/requests - most requested movies that are not in the library"
         )
     if is_owner:
         text += (
@@ -856,7 +927,8 @@ def home_keyboard(lang: str = "en"):
         [
             btn(f"☆ {tr(lang, 'b_help')}", BLUE, callback_data="help"),
             btn(f"¤ {tr(lang, 'b_about')}", GREEN, callback_data="about"),
-        ]
+        ],
+        [btn(f"✦ {tr(lang, 'b_trending')}", GREEN, callback_data="trend")],
     ]
     links = link_buttons(lang)
     if links:
@@ -905,6 +977,8 @@ async def get_force_channels():
 
 
 async def not_joined(client: Client, user_id: int):
+    if PREMIUM_SKIP_JOIN and is_premium(user_id):
+        return []  # premium users don't have to join the channels
     missing = []
     for ch in await get_force_channels():
         try:
@@ -955,17 +1029,68 @@ def search_text(title: str, caption: str) -> str:
     return text
 
 
-async def index_message(m: Message) -> bool:
+async def index_message(m: Message, notify: bool = False) -> bool:
+    """Saves a file in the database. notify=True is used for NEW files only: the users who requested
+    this movie get a message."""
     media = m.document or m.video or m.audio
     if not media:
         return False
     caption = m.caption or ""
     title = getattr(media, "file_name", None) or caption or f"file_{m.id}"
-    await store.upsert_file(
-        m.id, title, search_text(title, caption), media.file_size or 0, media.file_id, caption
-    )
+    search = search_text(title, caption)
+    await store.upsert_file(m.id, title, search, media.file_size or 0, media.file_id, caption)
     log.info("Indexed: %s", title)
+    if notify:
+        task = asyncio.create_task(notify_requesters(m.id, title, search))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     return True
+
+
+async def notify_requesters(msg_id: int, title: str, search: str):
+    """A new file arrived: every user whose request matches it gets a message, then the request is deleted."""
+    try:
+        rows = await store.all_requests()
+    except Exception as e:
+        log.warning("Could not read the movie requests (%s)", e)
+        return
+    hits = [(uid, q, raw) for uid, q, raw in rows if q and all(w in search for w in q.split())]
+    if not hits:
+        return
+    sent_to = 0
+    for uid, q, raw in hits:
+        lang = await lang_of_id(uid)
+        text = (
+            f"✓ <b>{tr(lang, 'req_done')}</b>\n"
+            + LINE
+            + f"\n☆ <i>{esc(raw)}</i>\n"
+            f"{file_icon(title)} {esc(tagged(title)[:150])}\n"
+            + LINE
+        )
+        kb = InlineKeyboardMarkup([[btn(f"□ {tr(lang, 'b_getfile')}", GREEN, callback_data=f"get|{msg_id}")]])
+        for attempt in (1, 2):
+            try:
+                await app.send_message(uid, text, reply_markup=kb, link_preview_options=NO_PREVIEW)
+                sent_to += 1
+                break
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+            except Exception as e:
+                log.info("Could not tell %s that the request is ready (%s)", uid, e)
+                break
+        await asyncio.sleep(0.1)
+    try:
+        await store.delete_requests([(uid, q) for uid, q, _ in hits])
+    except Exception as e:
+        log.warning("Could not delete the fulfilled requests (%s)", e)
+    group_text(
+        AUTO_GROUP,
+        "✓ <b>Requests Fulfilled</b>\n"
+        + LINE
+        + f"\n{file_icon(title)} <b>{esc(title[:150])}</b>\n"
+        f"♧ Users told: <b>{sent_to}</b> of {len(hits)}\n"
+        f"◇ Time: {now_ist()}",
+    )
 
 
 # Any new file posted in the DB channel is indexed automatically
@@ -978,7 +1103,7 @@ db_channel_filter = filters.create(_in_db_channel)  # follows DB_CHANNEL even af
 
 @app.on_message(db_channel_filter & (filters.document | filters.video | filters.audio))
 async def index_file(_, m: Message):
-    await index_message(m)
+    await index_message(m, notify=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1007,7 +1132,7 @@ if SOURCE_GROUPS:
 
         if uid:
             await store.mark_forwarded(uid)
-            await index_message(sent)
+            await index_message(sent, notify=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1092,8 +1217,6 @@ async def open_home(client: Client, chat_id: int, user):
 @app.on_message(filters.command("start") & user_place)
 @safe
 async def start_cmd(client: Client, m: Message):
-    if not m.from_user:
-        return
     if m.chat.id > 0:  # private chat only: groups are not saved as bot users / start cards
         is_new = await register_user(m.from_user.id)
         wanted = re.fullmatch(r"f(\d{1,12})", m.command[1]) if len(m.command) > 1 else None
@@ -1142,30 +1265,12 @@ async def lang_cb(client: Client, cq: CallbackQuery):
 
 @app.on_message(filters.command("help") & user_place)
 async def help_cmd(_, m: Message):
-    if not m.from_user:
-        return
     lang = await lang_of(m.from_user)
     await m.reply(
         help_text(is_admin_id(m.from_user.id), m.from_user.id in ADMINS, lang),
         reply_markup=back_keyboard(lang),
         quote=True,
     )
-
-
-@app.on_message(filters.command("request") & user_place)
-@safe
-async def request_cmd(client: Client, m: Message):
-    """/request name - the user asks for a movie/series, the request goes to the auto-reply group."""
-    if not m.from_user:
-        return
-    lang = await lang_of(m.from_user)
-    query = m.text.split(None, 1)[1].strip()[:100] if len(m.command) > 1 else ""
-    if not query:
-        return await m.reply(tr(lang, "a_requsage"), quote=True)
-    if m.chat.id > 0:
-        await register_user(m.from_user.id)
-    log_movie_request(m.from_user, query, requested=True)
-    await m.reply(tr(lang, "a_requested"), quote=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1187,19 +1292,24 @@ async def stats_cmd(_, m: Message):
                 )
         except Exception as e:
             log.warning("Could not read database status: %s", e)
+    try:
+        pending = len(await store.all_requests())
+    except Exception:
+        pending = 0
+    premium_now = sum(1 for until in PREMIUM.values() if until > time.time())
     await m.reply(
         "□ <b>Bot Statistics</b>\n"
         + LINE
         + f"\n☆ Files: <b>{files}</b>\n"
         f"♧ Users: <b>{users}</b>\n"
         f"♛ Admins: <b>{len(ALL_ADMINS)}</b>\n"
+        f"♛ Premium users: <b>{premium_now}</b>\n"
+        f"♤ Pending movie requests: <b>{pending}</b>\n"
         f"◇ Force-join channels: <b>{channels}</b>\n"
         f"¤ Auto-forward groups: <b>{len(SOURCE_GROUPS)}</b>\n"
         f"◇ Auto-delete: <b>{minutes() if AUTO_DELETE_SECONDS > 0 else 'off'}"
         f"{' min' if AUTO_DELETE_SECONDS > 0 else ''}</b>\n"
         f"□ Database: {kind}\n{db_lines}"
-        f"¤ Searches since start: <b>{SEARCHES['total']}</b> "
-        f"(✓ {SEARCHES['found']} • ✗ {SEARCHES['missed']})\n"
         f"◇ Uptime: <b>{fmt_uptime(time.time() - START_TIME)}</b>\n"
         + LINE,
         quote=True,
@@ -1260,7 +1370,10 @@ async def deladmin_cmd(client: Client, m: Message):
     ALL_ADMINS.discard(uid)
     await save_admins()
     try:
-        await client.set_bot_commands(USER_COMMANDS, scope=BotCommandScopeChat(uid))
+        await client.set_bot_commands(
+            [BotCommand("start", "Start the bot"), BotCommand("help", "How to use")],
+            scope=BotCommandScopeChat(uid),
+        )
     except Exception:
         pass
     await m.reply(f"✗ <b>Admin Removed</b>\n{LINE}\n♡ ID: <code>{uid}</code>", quote=True)
@@ -1799,14 +1912,23 @@ async def diag_cmd(client: Client, m: Message):
             token = f"diag{m.from_user.id}"
             cache_query(token, word)
             text, kb = await build_page(word, 0, token, await lang_of(m.from_user))
-            file_btns = (
-                [b for row in kb.inline_keyboard for b in row if (b.callback_data or "").startswith("get|")]
-                if kb
-                else []
-            )
+            rows = (getattr(kb, "inline_keyboard", None) or getattr(kb, "rows", None) or []) if kb else []
+            file_btns = [b for row in rows for b in row if (b.callback_data or "").startswith("get|")]
             add(bool(text and file_btns), f"Search '{esc(word)}': {len(file_btns)} file button(s) shown")
     except Exception as e:
         add(False, f"Search/buttons error: {esc(type(e).__name__)}: {esc(e)}")
+
+    try:  # 4b) movie info API (posters, ratings, trending)
+        t0 = time.time()
+        info = await moviedb.lookup("Inception", min_score=0.5, timeout=12)
+        ms = int((time.time() - t0) * 1000)
+        states = ", ".join(f"{k}: {v}" for k, v in moviedb.status().items())
+        if info:
+            add(True, f"Movie info API: works ({esc(info['source'])}, {ms} ms) • {states}")
+        else:
+            add(False, f"Movie info API: no answer ({ms} ms) • {states}")
+    except Exception as e:
+        add(False, f"Movie info API error: {esc(type(e).__name__)}: {esc(e)}")
 
     if sample:  # 5) real sending
         errors = []
@@ -1840,6 +1962,10 @@ async def diag_cmd(client: Client, m: Message):
     add(bool(BOT_USERNAME), f"Bot username: @{BOT_USERNAME or '?'} (group buttons need it)")
     add(None, f"Groups: commands work where the bot is admin • plain text search in groups: "
               f"{'ON' if GROUP_TEXT_SEARCH else 'OFF'} • language on every /start: {'ON' if ASK_LANGUAGE_ON_START else 'OFF'}")
+    add(None, f"Search: exact name first {'ON' if EXACT_FIRST else 'OFF'} • related results {'ON' if FUZZY_SEARCH else 'OFF'} "
+              f"• posters {'ON' if POSTER_ON_SEARCH else 'OFF'}")
+    add(None, f"Premium: {sum(1 for u in PREMIUM.values() if u > time.time())} user(s) • free daily limit: "
+              f"{FREE_DAILY_LIMIT or 'none'}")
     add(None, f"Admins: {len(ALL_ADMINS)}")
     await status.edit_text("♤ <b>Diagnosis</b>\n" + LINE + "\n" + "\n".join(lines))
 
@@ -1899,7 +2025,11 @@ async def del_cmd(_, m: Message):
         return await m.reply("¤ Nothing found. Try a shorter name.", quote=True)
     shown = results[:10]
     rows = [
-        [InlineKeyboardButton(f"✗ {human(size)} ┃ {title[:38]}", callback_data=f"dl|{mid}")]
+        [
+            InlineKeyboardButton(
+                f"✗ {human(size)} ┃ {title[:38]}", callback_data=f"dl|{mid}"
+            )
+        ]
         for mid, title, size in shown
     ]
     rows.append([InlineKeyboardButton("« Cancel", callback_data="dln")])
@@ -2045,7 +2175,7 @@ async def dbset_cb(client: Client, cq: CallbackQuery):
     await store.set_meta("last_scanned", "0")
     await edit(
         cq.message,
-        "◇ <b>Database channel changed.</b>\n" + LINE + f"\n¤ New: <code>{DB_CHANNEL}</code>\nScanning the channel, please wait...",
+        "⏳ <b>Database channel changed.</b>\n" + LINE + f"\n¤ New: <code>{DB_CHANNEL}</code>\nScanning the channel, please wait...".replace("⏳", "◇"),
     )
     await cq.answer("Saved ✓")
     task = asyncio.create_task(_scan_after_dbset(cq.message))
@@ -2054,63 +2184,548 @@ async def dbset_cb(client: Client, cq: CallbackQuery):
 
 
 # ----------------------------------------------------------------------------
+# GATE: private chat = language first, then the force-join check (used by the new commands)
+# ----------------------------------------------------------------------------
+async def gate(client: Client, m: Message, user) -> bool:
+    """True when the user may continue. Otherwise the language / join screen was already sent."""
+    if m.chat.id < 0:
+        return True
+    if not await has_chosen_lang(user.id):
+        await m.reply(lang_pick_text(), reply_markup=lang_keyboard(), quote=True)
+        return False
+    missing = await not_joined(client, user.id)
+    if missing:
+        text, kb = await join_view(missing, await lang_of(user))
+        await m.reply(text, reply_markup=kb, quote=True)
+        return False
+    await register_user(user.id)
+    return True
+
+
+# ----------------------------------------------------------------------------
+# PREMIUM COMMANDS
+# ----------------------------------------------------------------------------
+def fmt_date(ts: float) -> str:
+    return datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
+
+
+def perk_lines() -> str:
+    lines = []
+    if FREE_DAILY_LIMIT > 0:
+        lines.append(f"♛ Unlimited downloads (free users: {FREE_DAILY_LIMIT} per day)")
+    if PREMIUM_NO_AUTODELETE and AUTO_DELETE_SECONDS > 0:
+        lines.append("♛ Your files are never auto-deleted")
+    if PREMIUM_SKIP_JOIN:
+        lines.append("♛ No need to join the channels")
+    if FLOOD_LIMIT > 0:
+        lines.append("♛ No search speed limit")
+    lines.append("♛ Priority support")
+    return "\n".join(lines)
+
+
+async def premium_args(client: Client, m: Message):
+    """(user id, days) from: reply + days | user id or @username + days. Days default to 30."""
+    args = m.command[1:]
+    r = m.reply_to_message
+    uid = target_from_card(r)
+    if not uid and r and r.from_user and not getattr(r.from_user, "is_self", False):
+        uid = r.from_user.id
+    if uid:
+        days_arg = args[0] if args else ""
+    else:
+        days_arg = args[1] if len(args) > 1 else ""
+        if args:
+            arg = args[0].lstrip("@")
+            if re.fullmatch(r"\d{5,15}", arg):
+                uid = int(arg)
+            else:
+                try:
+                    uid = (await client.get_users(arg)).id
+                except Exception:
+                    uid = 0
+    days = int(days_arg) if days_arg.isdigit() else 30
+    return uid, max(1, min(days, 3650))
+
+
+@app.on_message(filters.command("addpremium") & admin_place & admin_filter)
+@safe
+async def addpremium_cmd(client: Client, m: Message):
+    uid, days = await premium_args(client, m)
+    if not uid:
+        return await m.reply(
+            "♛ <b>Add Premium</b>\n"
+            + LINE
+            + "\n<code>/addpremium 123456789 30</code> - 30 days\n"
+            "<code>/addpremium @username 7</code> - 7 days\n"
+            "or <b>reply</b> to the user's message / card with <code>/addpremium 30</code>\n"
+            "Days are optional (default 30). Giving it again adds more days.\n"
+            + LINE,
+            quote=True,
+        )
+    PREMIUM[uid] = max(PREMIUM.get(uid, 0), time.time()) + days * 86400
+    await save_premium()
+    until = fmt_date(PREMIUM[uid])
+    told = "✓ user was told"
+    try:
+        lang = await lang_of_id(uid)
+        await client.send_message(
+            uid,
+            f"♛ <b>{tr(lang, 'plan_prem')}</b> ✓\n{LINE}\n◇ {tr(lang, 'plan_exp')}: <b>{until}</b>\n\n"
+            f"{perk_lines()}\n{LINE}\n/myplan",
+        )
+    except Exception:
+        told = "▲ could not message the user (he must press /start first)"
+    await m.reply(
+        f"♛ <b>Premium Added</b>\n{LINE}\n¤ ID: <code>{uid}</code>\n◇ Until: <b>{until}</b> (+{days} days)\n{told}",
+        quote=True,
+    )
+    group_text(
+        AUTO_GROUP,
+        f"♛ <b>Premium Added</b>\n{LINE}\n¤ ID: <code>{uid}</code>\n◇ Until: {until}\n♛ By: {m.from_user.mention}\n◇ Time: {now_ist()}",
+    )
+
+
+@app.on_message(filters.command("delpremium") & admin_place & admin_filter)
+@safe
+async def delpremium_cmd(client: Client, m: Message):
+    uid = await ban_target(client, m)
+    if not uid or uid not in PREMIUM:
+        return await m.reply("Usage: <code>/delpremium 123456789</code> (the user must be premium)", quote=True)
+    PREMIUM.pop(uid, None)
+    await save_premium()
+    await m.reply(f"✗ <b>Premium Removed</b>\n{LINE}\n¤ ID: <code>{uid}</code>", quote=True)
+
+
+@app.on_message(filters.command("premiums") & admin_place & admin_filter)
+async def premiums_cmd(_, m: Message):
+    now = time.time()
+    rows = [
+        f"♛ <code>{u}</code> ┃ until {fmt_date(t)} ({int((t - now) // 86400)}d)"
+        for u, t in sorted(PREMIUM.items(), key=lambda kv: kv[1])
+        if t > now
+    ]
+    await m.reply(
+        f"♛ <b>Premium Users</b> ({len(rows)})\n{LINE}\n" + ("\n".join(rows[:60]) or "none"),
+        quote=True,
+    )
+
+
+@app.on_message(filters.command("myplan") & user_place)
+@safe
+async def myplan_cmd(client: Client, m: Message):
+    if not m.from_user:
+        return
+    user = m.from_user
+    lang = await lang_of(user)
+    if m.chat.id > 0:
+        await register_user(user.id)
+    admin = user.id in ALL_ADMINS
+    prem = is_premium(user.id)
+    used = downloads_today(user.id)
+    if admin:
+        plan = f"♛ {tr(lang, 'plan_admin')}"
+    elif prem:
+        plan = f"♛ {tr(lang, 'plan_prem')}"
+    else:
+        plan = f"♧ {tr(lang, 'plan_free')}"
+    unlimited = admin or prem or FREE_DAILY_LIMIT <= 0
+    today = f"{used} / {tr(lang, 'plan_unl')}" if unlimited else f"{used} / {FREE_DAILY_LIMIT}"
+    text = f"♛ <b>{tr(lang, 'plan_title')}</b>\n{LINE}\n♧ {tr(lang, 'plan_type')}: <b>{plan}</b>\n"
+    if prem and not admin:
+        days = max(int((PREMIUM[user.id] - time.time()) // 86400), 0)
+        text += f"◇ {tr(lang, 'plan_exp')}: <b>{fmt_date(PREMIUM[user.id])}</b> ({tr(lang, 'plan_days', d=days)})\n"
+    text += f"☆ {tr(lang, 'plan_today')}: <b>{today}</b>\n"
+    if not prem and not admin:
+        text += f"{LINE}\n♤ <b>{tr(lang, 'plan_perks')}</b>\n{perk_lines()}"
+    text += f"\n{LINE}"
+    kb = None
+    if not prem and not admin and OWNER_USERNAME:
+        kb = InlineKeyboardMarkup([[btn(f"♛ {tr(lang, 'b_buy')}", GREEN, url=f"https://t.me/{OWNER_USERNAME}")]])
+    await m.reply(text, reply_markup=kb, quote=True)
+
+
+# ----------------------------------------------------------------------------
+# MOVIE REQUESTS: /request name (or the Request button when nothing was found).
+# When a matching file is added later, the user gets a message (see notify_requesters).
+# ----------------------------------------------------------------------------
+REQ_TEXT = {"ok": "req_sent", "dup": "req_dup", "limit": "req_limit", "exists": "req_exists", "bad": "req_bad"}
+
+
+async def do_request(user, query: str) -> str:
+    """Saves a request. Returns 'ok', 'dup', 'limit', 'exists' (already in the library) or 'bad'."""
+    query = (query or "").strip()[:100]
+    q = norm(to_latin(query))
+    if len(q) < 2:
+        return "bad"
+    found = await store.find(q.split())
+    want = moviedb.title_key(query)
+    if found and (not want or any(moviedb.title_key(t) == want for _, t, _ in found)):
+        return "exists"
+    status = await store.add_request(user.id, q, query, REQUEST_LIMIT)
+    if status == "ok":
+        log_movie_request(user, query, explicit=True)
+    return status
+
+
+@app.on_message(filters.command("request") & user_place)
+@safe
+async def request_cmd(client: Client, m: Message):
+    if not m.from_user or not await gate(client, m, m.from_user):
+        return
+    lang = await lang_of(m.from_user)
+    query = m.text.split(None, 1)[1].strip() if len(m.command) > 1 else ""
+    if not query:
+        return await m.reply(tr(lang, "req_usage"), quote=True)
+    status = await do_request(m.from_user, query)
+    reply = await m.reply(f"♤ {tr(lang, REQ_TEXT[status], n=REQUEST_LIMIT)}", quote=True)
+    schedule_delete(reply, m)
+
+
+@app.on_callback_query(filters.regex(r"^rq\|"))
+@safe
+async def request_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
+    query = _search_cache.get(cq.data.split("|", 1)[1])
+    if not query:
+        return await cq.answer(tr(lang, "a_expired"), show_alert=True)
+    status = await do_request(cq.from_user, query)
+    await cq.answer(f"{tr(lang, REQ_TEXT[status], n=REQUEST_LIMIT)}", show_alert=True)
+
+
+@app.on_message(filters.command("requests") & admin_place & admin_filter)
+@safe
+async def requests_cmd(_, m: Message):
+    rows = await store.all_requests()
+    counts = collections.Counter(q for _, q, _ in rows)
+    top = counts.most_common(25)
+    body = "\n".join(f"<b>{n}×</b> <code>{esc(q[:60])}</code>" for q, n in top) or "none"
+    await m.reply(
+        f"♤ <b>Most Requested</b> ({len(rows)} pending)\n{LINE}\n{body}\n{LINE}\n"
+        "<i>When you add a matching file, the users are told automatically.</i>",
+        quote=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# MOVIE INFO: poster, rating, plot, cast, trailer (free APIs, see moviedb.py)
+# ----------------------------------------------------------------------------
+_info_cache: dict = {}  # search token -> info of the searched movie (None = nothing found)
+_info_by_id: dict = {}  # info id -> info (for the "Find in bot" button)
+
+
+async def safe_lookup(query: str, min_score: float = 0.72, timeout: float = None):
+    """Info of a movie, or None. Never raises."""
+    try:
+        return await moviedb.lookup(query, min_score=min_score, timeout=timeout or INFO_TIMEOUT)
+    except Exception as e:
+        log.warning("Movie info lookup failed (%s)", e)
+        return None
+
+
+def info_line(info: dict) -> str:
+    """'◇ Inception (2010)  ★ 8.8' - one line for the search page."""
+    line = f"◇ <b>{esc(info['title'])}</b>"
+    if info.get("year"):
+        line += f" ({esc(info['year'])})"
+    if info.get("rating"):
+        line += f"  ★ {esc(info['rating'])}"
+    return line
+
+
+def info_text(info: dict, lang: str = "en") -> str:
+    head = f"◇ <b>{esc(info['title'])}</b>" + (f" ({esc(info['year'])})" if info.get("year") else "")
+    bits = []
+    if info.get("rating"):
+        bits.append(f"★ <b>{esc(info['rating'])}</b>/10")
+    bits.append("♧ Series" if info.get("type") == "series" else "☆ Movie")
+    if info.get("runtime"):
+        bits.append(f"◇ {esc(info['runtime'])}")
+    lines = [head, LINE, "  ┃  ".join(bits)]
+    if info.get("genres"):
+        lines.append(f"♤ {esc(', '.join(info['genres'][:4]))}")
+    if info.get("director"):
+        lines.append(f"♛ {esc(', '.join(info['director'][:2]))}")
+    if info.get("cast"):
+        lines.append(f"♧ {esc(', '.join(info['cast'][:5]))}")
+    body = "\n".join(lines)
+    plot = (info.get("plot") or "").strip()
+    room = 960 - plain_len(body) - len(LINE)  # a photo caption holds 1024 characters
+    if plot and room > 80:
+        if len(plot) > room:
+            plot = plot[: room - 1].rsplit(" ", 1)[0] + "…"
+        body += f"\n\n<i>{esc(plot)}</i>"
+    return body + f"\n{LINE}"
+
+
+def info_keyboard(info: dict, lang: str = "en"):
+    first = [btn(f"▶ {tr(lang, 'b_trailer')}", BLUE, url=info["trailer"])]
+    if info.get("imdb_url"):
+        first.append(InlineKeyboardButton("★ IMDb", url=info["imdb_url"]))
+    return InlineKeyboardMarkup(
+        [
+            first,
+            [btn(f"¤ {tr(lang, 'b_findbot')}", GREEN, callback_data=f"is|{info['id']}"[:64])],
+            [btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")],
+        ]
+    )
+
+
+async def reply_with_poster(target: Message, poster: str, text: str, kb, quote: bool = True):
+    """Replies with the poster and the text as its caption. If the poster can't be sent: only the text."""
+    if poster and plain_len(text) <= 1024:
+        for attempt in (0, 1):
+            try:
+                photo = poster
+                if attempt == 1:  # Telegram could not fetch the url: download it here and upload it
+                    photo = await moviedb.fetch_image(poster)
+                    if not photo:
+                        break
+                return await target.reply_photo(photo, caption=text, reply_markup=kb, quote=quote)
+            except FloodWait:
+                raise
+            except Exception as e:
+                log.info("Poster not sent (attempt %s): %s", attempt + 1, e)
+    return await target.reply(text, reply_markup=kb, quote=quote, link_preview_options=NO_PREVIEW)
+
+
+async def send_info_card(target: Message, info: dict, lang: str, quote: bool = True, delete_also=()):
+    if len(_info_by_id) > 500:
+        _info_by_id.clear()
+    _info_by_id[info["id"]] = info
+    reply = await reply_with_poster(target, info.get("poster"), info_text(info, lang), info_keyboard(info, lang), quote)
+    schedule_delete(reply, *delete_also)
+    return reply
+
+
+@app.on_message(filters.command("info") & user_place)
+@safe
+async def info_cmd(client: Client, m: Message):
+    """/info Inception - poster, rating, plot, cast and trailer."""
+    if not m.from_user or not await gate(client, m, m.from_user):
+        return
+    lang = await lang_of(m.from_user)
+    query = m.text.split(None, 1)[1].strip()[:100] if len(m.command) > 1 else ""
+    if not query:
+        return await m.reply(tr(lang, "info_usage"), quote=True)
+    if flood_blocked(m.from_user.id):
+        return
+    try:
+        await client.send_chat_action(m.chat.id, enums.ChatAction.TYPING)
+    except Exception:
+        pass
+    info = await safe_lookup(query, min_score=0.45, timeout=8)
+    if not info:
+        reply = await m.reply(f"¤ {tr(lang, 'info_nf')}", quote=True)
+        return schedule_delete(reply, m)
+    await send_info_card(m, info, lang, quote=True, delete_also=(m,))
+
+
+@app.on_callback_query(filters.regex(r"^inf\|"))
+@safe
+async def info_cb(client: Client, cq: CallbackQuery):
+    """The Info button under a search result."""
+    lang = await lang_of(cq.from_user)
+    token = cq.data.split("|", 1)[1]
+    info = _info_cache.get(token)
+    if not info:
+        query = _search_cache.get(token)
+        if not query:
+            return await cq.answer(tr(lang, "a_expired"), show_alert=True)
+        info = await safe_lookup(query, min_score=0.45, timeout=8)
+        if not info:
+            return await cq.answer(tr(lang, "info_nf"), show_alert=True)
+    await cq.answer()
+    await send_info_card(cq.message, info, lang, quote=False)
+
+
+@app.on_callback_query(filters.regex(r"^is\|"))
+@safe
+async def info_find_cb(client: Client, cq: CallbackQuery):
+    """'Find in bot' under an info card: searches the library for that title."""
+    lang = await lang_of(cq.from_user)
+    info = _info_by_id.get(cq.data.split("|", 1)[1])
+    if not info:
+        return await cq.answer(tr(lang, "a_expired"), show_alert=True)
+    await cq.answer()
+    await search_from_callback(client, cq, info["title"])
+
+
+# ----------------------------------------------------------------------------
+# TRENDING: popular movies / series / top rated (Cinemeta lists). Tapping a title searches the library.
+# ----------------------------------------------------------------------------
+TREND_LISTS = {
+    "pm": ("movie", "top", "b_popmovies"),
+    "ps": ("series", "top", "b_popseries"),
+    "pt": ("movie", "imdbRating", "b_toprated"),
+}
+TREND_PER_PAGE = 8
+
+
+def trend_menu_view(lang: str):
+    text = f"✦ <b>{tr(lang, 'trend_title')}</b>\n{LINE}\n♤ {tr(lang, 'trend_pick')}\n{LINE}"
+    kb = InlineKeyboardMarkup(
+        [
+            [btn(f"☆ {tr(lang, 'b_popmovies')}", BLUE, callback_data="tl|pm|0")],
+            [btn(f"♧ {tr(lang, 'b_popseries')}", BLUE, callback_data="tl|ps|0")],
+            [btn(f"★ {tr(lang, 'b_toprated')}", GREEN, callback_data="tl|pt|0")],
+            [InlineKeyboardButton(f"□ {tr(lang, 'b_home')}", callback_data="home")],
+        ]
+    )
+    return text, kb
+
+
+async def trend_list_view(key: str, page: int, lang: str):
+    kind, catalog, label = TREND_LISTS[key]
+    items = await moviedb.trending(kind, catalog)
+    if not items:
+        return None, None
+    pages = max(math.ceil(len(items) / TREND_PER_PAGE), 1)
+    page = min(max(page, 0), pages - 1)
+    start = page * TREND_PER_PAGE
+    text = (
+        f"✦ <b>{tr(lang, label)}</b>\n{LINE}\n□ {tr(lang, 'page')} <b>{page + 1}/{pages}</b>\n{LINE}\n"
+        f"▼ {tr(lang, 'trend_tap')}"
+    )
+    rows = []
+    for i, it in enumerate(items[start:start + TREND_PER_PAGE], start + 1):
+        name = f"{i}. {it['title'][:30]}"
+        if it.get("year"):
+            name += f" ({it['year']})"
+        if it.get("rating"):
+            name += f" ★{it['rating']}"
+        rows.append([InlineKeyboardButton(name[:60], callback_data=f"ts|{it['id']}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("«", callback_data=f"tl|{key}|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"□ {page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("»", callback_data=f"tl|{key}|{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="trend")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+@app.on_message(filters.command(["trending", "popular"]) & user_place)
+@safe
+async def trending_cmd(client: Client, m: Message):
+    if not m.from_user or not await gate(client, m, m.from_user):
+        return
+    lang = await lang_of(m.from_user)
+    text, kb = trend_menu_view(lang)
+    reply = await m.reply(text, reply_markup=kb, quote=True)
+    schedule_delete(reply, m)
+
+
+@app.on_callback_query(filters.regex(r"^trend$"))
+@safe
+async def trend_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
+    text, kb = trend_menu_view(lang)
+    await edit(cq.message, text, kb)
+    await cq.answer()
+
+
+@app.on_callback_query(filters.regex(r"^tl\|"))
+@safe
+async def trend_list_cb(client: Client, cq: CallbackQuery):
+    _, key, page = cq.data.split("|")
+    if key not in TREND_LISTS or not page.isdigit():
+        return await cq.answer()
+    lang = await lang_of(cq.from_user)
+    await cq.answer()  # the list may need a moment to load
+    text, kb = await trend_list_view(key, int(page), lang)
+    if not text:
+        text = f"▲ {tr(lang, 'trend_fail')}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="trend")]])
+    await edit(cq.message, text, kb)
+
+
+@app.on_callback_query(filters.regex(r"^ts\|"))
+@safe
+async def trend_search_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
+    item = moviedb.find_trending(cq.data.split("|", 1)[1])
+    if not item:
+        return await cq.answer(tr(lang, "a_expired"), show_alert=True)
+    await cq.answer()
+    await search_from_callback(client, cq, item["title"])
+
+
+# ----------------------------------------------------------------------------
 # SEARCH
 # ----------------------------------------------------------------------------
 _search_cache: dict = {}
+
+
 _filter_cache: dict = {}  # token -> {"q": "1080p", "l": "hin", "s": "1"}
 
 
 def cache_query(token: str, query: str):
     _search_cache[token] = query
     _filter_cache.pop(token, None)
+    _info_cache.pop(token, None)
     while len(_search_cache) > 500:
         old = next(iter(_search_cache))
         _search_cache.pop(old)
         _filter_cache.pop(old, None)
+        _info_cache.pop(old, None)
 
 
-def dedupe(results):
-    """Same name + same size = same file posted twice: show it once."""
-    seen, out = set(), []
-    for mid, title, size in results:
-        key = (norm(title), size)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((mid, title, size))
-    return out
+def exact_filter(query: str, results: list) -> list:
+    """If some files have EXACTLY the typed name ('Money Heist'), show only those and not
+    'Money Heist Korea' or other related names. If none has, everything that matched stays."""
+    if not EXACT_FIRST or not results:
+        return results
+    want = moviedb.title_key(query)
+    if not want:
+        return results
+    exact = [r for r in results if moviedb.title_key(r[1]) == want]
+    return exact or results
 
 
-async def _run_search(query: str):
+async def run_search(query: str):
+    """(results, fuzzy). Understands other scripts (Hindi, Tamil...) and different spellings."""
     words = norm(query).split()
     results = await store.find(words)
     if results:
-        return results, False
+        return exact_filter(query, results), False
 
     latin = to_latin(query)  # "मां तुझे सलाम" -> "man tujhe salam"
     lwords = norm(latin).split() if latin != query else words
     if lwords and lwords != words:
         results = await store.find(lwords)
         if results:
-            return results, False
+            return exact_filter(latin, results), False
 
-    if lwords:  # spelling-tolerant (every word must still sound like the title): salam = salaam
+    if lwords:  # spelling-tolerant: salam = salaam, maan = maa ...
         prefixes = list({w[:3] for w in lwords if len(w) >= 2})
         candidates = await store.find_any(prefixes, limit=600) if prefixes else []
         results = phonetic_rank(lwords, candidates)
         if results:
             return results, True
+
+    if FUZZY_SEARCH and len(lwords) >= 2:  # looser: files that contain only some of the words
+        useful = [w for w in lwords if len(w) >= 3] or lwords
+        results = await store.find_any(useful)
+        if results:
+            return results, True
     return [], False
 
 
-async def run_search(query: str):
-    """(results, fuzzy). Whole words only, understands other scripts (Hindi, Tamil...) and spelling changes."""
-    results, fuzzy = await _run_search(query)
-    return dedupe(results), fuzzy
-
-
-async def build_page(query: str, page: int, token: str, lang: str = "en", group_links: bool = False):
+async def build_page(query: str, page: int, token: str, lang: str = "en", group_links: bool = False, info_task=None):
     all_results, fuzzy = await run_search(query)
+
+    # movie info (poster, rating): asked at the same time as the search; page buttons reuse the saved answer
+    if info_task is not None:
+        info = await info_task
+        if info is None and all_results and (fuzzy or not query.isascii()):
+            # typed in another script / misspelled: the name of the first file is a better question
+            info = await safe_lookup(moviedb.clean_title(all_results[0][1]))
+        _info_cache[token] = info
+    else:
+        info = _info_cache.get(token)
+
     if not all_results:
         return None, None
 
@@ -2175,6 +2790,8 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         + f"\n□ {tr(lang, 'query')}: <i>{esc(query[:60])}</i>\n"
         f"□ {tr(lang, 'found')}: <b>{total}</b>  •  {tr(lang, 'page')} <b>{page + 1}/{pages}</b>\n"
     )
+    if info:
+        text += info_line(info) + "\n"
     active_parts = []
     if sel.get("q"):
         active_parts.append(sel["q"])
@@ -2186,12 +2803,11 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
         text += f"◇ {tr(lang, 'filter')}: <b>{' • '.join(active_parts)}</b>\n"
     if fuzzy:
         text += f"¤ <i>{tr(lang, 'no_exact')}</i>\n"
-    if group_links:
-        text += LINE + f"\n▼ {tr(lang, 'step2')}"
-    else:
-        text += LINE + f"\n▼ <b>{tr(lang, 'choose')}</b>"
+    text += LINE + f"\n▼ <b>{tr(lang, 'choose')}</b>" if not group_links else LINE + f"\n▼ {tr(lang, 'step2')}"
 
     rows = []
+    if info:
+        rows.append([btn(f"♤ {tr(lang, 'b_info')}", BLUE, callback_data=f"inf|{token}")])
     if not group_links:  # in a group only the file buttons are shown (no filter rows)
         rows += facet_rows("q", q_opts, lambda v: v, 3)
         rows += facet_rows("l", l_opts, lambda v: LANG_NAMES[v], 3)
@@ -2219,16 +2835,17 @@ async def build_page(query: str, page: int, token: str, lang: str = "en", group_
     return text, InlineKeyboardMarkup(rows)
 
 
-def not_found_text(query: str, lang: str = "en") -> str:
+def not_found_text(query: str, lang: str = "en", info: dict = None) -> str:
     return (
         f"¤ <b>{tr(lang, 'nf_title')}</b>\n"
         + LINE
-        + f"\n¤ <i>{esc(query[:60])}</i>\n\n"
-        f"♤ <b>{tr(lang, 'nf_try')}:</b>\n"
+        + f"\n¤ <i>{esc(query[:60])}</i>\n"
+        + (f"{info_line(info)}\n" if info else "")
+        + f"\n♤ <b>{tr(lang, 'nf_try')}:</b>\n"
         f"• {tr(lang, 'nf1')}\n"
         f"• {tr(lang, 'nf2')}\n"
-        f"• {tr(lang, 'nf3')}\n"
-        f"• /request <code>{esc(query[:30])}</code>\n"
+        f"• {tr(lang, 'nf3')}\n\n"
+        f"♡ {tr(lang, 'nf_req')}\n"
         + LINE
     )
 
@@ -2239,26 +2856,26 @@ def not_found_text(query: str, lang: str = "en") -> str:
     & ~filters.command(
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
-            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language",
-            "search", "s", "movie", "request", "diag", "logs", "ban", "unban", "banned", "ping",
+            "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language", "search", "s", "movie", "diag", "addgroup", "delgroup", "groups", "logs", "ban", "unban", "banned", "ping",
+            "info", "trending", "popular", "request", "requests", "myplan", "addpremium", "delpremium", "premiums",
         ]
     )
 )
 @safe
 async def search_handler(client: Client, m: Message):
-    if not m.from_user:
-        return
     await register_user(m.from_user.id)
     await do_search(client, m, m.text[:100])
 
 
 _pending_query: dict = {}  # user id -> (message, query) waiting while he chooses his language
+
+
 _flood: dict = {}
 
 
 def flood_blocked(user_id: int) -> bool:
     """True when the user searches too fast (FLOOD_LIMIT searches in FLOOD_WINDOW seconds)."""
-    if FLOOD_LIMIT <= 0 or user_id in ALL_ADMINS:
+    if FLOOD_LIMIT <= 0 or user_id in ALL_ADMINS or is_premium(user_id):
         return False
     now = time.time()
     if len(_flood) > 5000:
@@ -2272,12 +2889,46 @@ def flood_blocked(user_id: int) -> bool:
     return False
 
 
+async def deliver_results(client: Client, target: Message, user, lang: str, query: str,
+                          quote: bool = True, delete_also=(), silent: bool = False):
+    """Searches `query` and sends the result page (with the poster when one is found) as a reply to `target`.
+
+    silent=True (plain text in a group): nothing is sent when nothing is found."""
+    chat_id = target.chat.id
+    token = f"{chat_id}{user.id}{target.id}{int(time.time()) % 1000}"
+    # silent = ordinary chat text in a group: no info lookups for those
+    info_task = asyncio.create_task(safe_lookup(query)) if (POSTER_ON_SEARCH and not silent) else None
+    cache_query(token, query)
+    text, kb = await build_page(query, 0, token, lang, chat_id < 0, info_task)
+    info = _info_cache.get(token)
+
+    if not text:
+        log_movie_request(user, query)
+        if silent:
+            return None
+        rows = []
+        if info:
+            rows.append([btn(f"♤ {tr(lang, 'b_info')}", BLUE, callback_data=f"inf|{token}")])
+        rows.append([btn(f"♡ {tr(lang, 'b_request')}", GREEN, callback_data=f"rq|{token}")])
+        if SUPPORT_USERNAME:
+            rows.append([btn(f"♡ {tr(lang, 'b_support')}", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
+        rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
+        reply = await reply_with_poster(
+            target, info.get("poster") if info else None, not_found_text(query, lang, info),
+            InlineKeyboardMarkup(rows), quote,
+        )
+        schedule_delete(reply, *delete_also)
+        return reply
+
+    reply = await reply_with_poster(target, info.get("poster") if info else None, text, kb, quote)
+    schedule_delete(reply, *delete_also)
+    return reply
+
+
 async def do_search(client: Client, m: Message, query: str, silent: bool = False):
     """Searches `query` and replies with the result page (private chat or group).
 
     silent=True (plain text in a group): nothing is sent when nothing is found."""
-    if not m.from_user:
-        return
     if flood_blocked(m.from_user.id):
         log.info("Flood: ignored a search of %s", m.from_user.id)
         return
@@ -2299,32 +2950,21 @@ async def do_search(client: Client, m: Message, query: str, silent: bool = False
     except Exception:
         pass
 
-    token = f"{m.chat.id}{m.from_user.id}{m.id}"
-    cache_query(token, query)
-    text, kb = await build_page(query, 0, token, lang, m.chat.id < 0)
+    await deliver_results(client, m, m.from_user, lang, query, quote=True, delete_also=(m,), silent=silent)
 
-    if not silent:
-        SEARCHES["total"] += 1
-        SEARCHES["found" if text else "missed"] += 1
 
-    if not text:
-        if silent:  # normal chat in a group: no reply, no request card
-            return
-        log_movie_request(m.from_user, query)
-        rows = []
-        if SUPPORT_USERNAME:
-            rows.append([btn(f"♡ {tr(lang, 'b_support')}", BLUE, url=f"https://t.me/{SUPPORT_USERNAME}")])
-        rows.append([btn(f"× {tr(lang, 'b_close')} ×", RED, callback_data="close")])
-        reply = await m.reply(
-            not_found_text(query, lang),
-            reply_markup=InlineKeyboardMarkup(rows),
-            quote=True,
-        )
-        schedule_delete(reply, m)
+async def search_from_callback(client: Client, cq: CallbackQuery, query: str):
+    """A button (trending list, 'Find in bot') searches the library: the result page is sent as a new message."""
+    user = cq.from_user
+    lang = await lang_of(user)
+    if flood_blocked(user.id):
         return
-
-    reply = await m.reply(text, reply_markup=kb, quote=True)
-    schedule_delete(reply, m)
+    if cq.message.chat.id > 0:
+        missing = await not_joined(client, user.id)
+        if missing:
+            text, kb = await join_view(missing, lang)
+            return await cq.message.reply(text, reply_markup=kb, quote=False)
+    await deliver_results(client, cq.message, user, lang, query[:100], quote=False)
 
 
 @app.on_message(filters.command(["search", "s", "movie"]) & user_place)
@@ -2467,13 +3107,13 @@ async def page_cb(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
-def file_caption(title: str, size: int, lang: str = "en") -> str:
+def file_caption(title: str, size: int, lang: str = "en", autodel: bool = True) -> str:
     text = (
         f"{file_icon(title)} <b>{esc(tagged(title)[:200])}</b>\n"
         + LINE
         + f"\n□ {tr(lang, 'size')}: <b>{human(size)}</b>\n"
     )
-    if AUTO_DELETE_SECONDS > 0:
+    if AUTO_DELETE_SECONDS > 0 and autodel:
         text += f"◇ {tr(lang, 'f_autodel', minutes=minutes())}\n"
     text += LINE + f"\n✓ <i>{tr(lang, 'save_now')}</i>"
     if BOT_USERNAME:
@@ -2489,7 +3129,9 @@ async def send_file(client: Client, user, lang: str, msg_id: int, errors: list =
     row = await store.get_file(msg_id)
     title = (row or {}).get("title") or f"file_{msg_id}"
     size = (row or {}).get("size", 0)
-    caption = file_caption(title, size, lang)
+    # premium users can keep their files (no auto-delete)
+    autodel = AUTO_DELETE_SECONDS > 0 and not (PREMIUM_NO_AUTODELETE and is_premium(user.id))
+    caption = file_caption(title, size, lang, autodel)
     kb = file_keyboard(lang)
     sent = None
 
@@ -2527,7 +3169,9 @@ async def send_file(client: Client, user, lang: str, msg_id: int, errors: list =
             return None
 
     log_file_sent(user, title, size)
-    schedule_file_delete(client, sent, user, lang, msg_id, title)
+    count_download(user.id)
+    if autodel:
+        schedule_file_delete(client, sent, user, lang, msg_id, title)
     return sent
 
 
@@ -2536,6 +3180,9 @@ async def deliver_pending(client: Client, user, chat_id: int, lang: str) -> bool
     msg_id = _pending_file.pop(user.id, None)
     if msg_id is None:
         return False
+    if limit_reached(user.id):
+        await client.send_message(chat_id, f"▲ {tr(lang, 'a_limit', n=FREE_DAILY_LIMIT)}")
+        return True
     if not await send_file(client, user, lang, msg_id):
         await client.send_message(chat_id, tr(lang, "a_filefail"))
     return True
@@ -2551,6 +3198,8 @@ async def again_cb(client: Client, cq: CallbackQuery):
         await cq.answer(tr(lang, "a_joinfirst"), show_alert=True)
         text, kb = await join_view(missing, lang)
         return await client.send_message(cq.from_user.id, text, reply_markup=kb)
+    if limit_reached(cq.from_user.id):
+        return await cq.answer(tr(lang, "a_limit", n=FREE_DAILY_LIMIT), show_alert=True)
     msg_id = int(cq.data.split("|")[1])
     if not await send_file(client, cq.from_user, lang, msg_id):
         return await cq.answer(tr(lang, "a_filefail"), show_alert=True)
@@ -2574,6 +3223,9 @@ async def get_cb(client: Client, cq: CallbackQuery):
         except Exception:
             return  # (group user who never started the bot: the alert above is enough)
 
+    if limit_reached(cq.from_user.id):
+        return await cq.answer(tr(lang, "a_limit", n=FREE_DAILY_LIMIT), show_alert=True)
+
     msg_id = int(cq.data.split("|")[1])
     if not await send_file(client, cq.from_user, lang, msg_id):
         if cq.message.chat.id < 0 and BOT_USERNAME:  # pressed in a group, but the bot can't write to him
@@ -2582,7 +3234,6 @@ async def get_cb(client: Client, cq: CallbackQuery):
             )
         return await cq.answer(tr(lang, "a_filefail"), show_alert=True)
     await cq.answer(f"□ {tr(lang, 'a_filesent')} ✓")
-
 
 # ----------------------------------------------------------------------------
 # START
@@ -2617,45 +3268,50 @@ async def _startup_scan():
     await notify_admins(text)
 
 
-USER_COMMANDS = [
-    BotCommand("start", "Start the bot"),
-    BotCommand("help", "How to use"),
-    BotCommand("language", "Change language"),
-    BotCommand("search", "Search a movie: /search name"),
-    BotCommand("request", "Request a movie: /request name"),
-]
-ADMIN_COMMANDS = USER_COMMANDS + [
-    BotCommand("stats", "Bot statistics"),
-    BotCommand("broadcast", "Message everyone"),
-    BotCommand("index", "Index the DB channel"),
-    BotCommand("addchannel", "Add force-join channel"),
-    BotCommand("delchannel", "Remove a channel"),
-    BotCommand("channels", "List channels"),
-    BotCommand("setstart", "Set start image"),
-    BotCommand("delstart", "Remove start image"),
-    BotCommand("admins", "List admins"),
-    BotCommand("diag", "Check why files are not sending"),
-    BotCommand("logs", "Send the logs to the log group"),
-    BotCommand("ban", "Ban a user"),
-    BotCommand("unban", "Unban a user"),
-    BotCommand("ping", "Is the bot alive?"),
-    BotCommand("sent", "Send a message/file to a user"),
-]
-OWNER_COMMANDS = ADMIN_COMMANDS + [
-    BotCommand("addadmin", "Add an admin"),
-    BotCommand("deladmin", "Remove an admin"),
-    BotCommand("del", "Delete a file from the database"),
-    BotCommand("dbset", "Set the database channel"),
-]
-
-
 async def set_menu_commands():
     """Commands shown in Telegram's command menu (when you tap /)."""
+    user_cmds = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "How to use"),
+        BotCommand("language", "Change language"),
+        BotCommand("search", "Search a movie: /search name"),
+        BotCommand("info", "Poster, rating and plot: /info name"),
+        BotCommand("trending", "Popular movies and series"),
+        BotCommand("request", "Request a movie: /request name"),
+        BotCommand("myplan", "My plan and downloads"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("stats", "Bot statistics"),
+        BotCommand("broadcast", "Message everyone"),
+        BotCommand("index", "Index the DB channel"),
+        BotCommand("addchannel", "Add force-join channel"),
+        BotCommand("delchannel", "Remove a channel"),
+        BotCommand("channels", "List channels"),
+        BotCommand("setstart", "Set start image"),
+        BotCommand("delstart", "Remove start image"),
+        BotCommand("admins", "List admins"),
+        BotCommand("diag", "Check why files are not sending"),
+        BotCommand("logs", "Send the logs to the log group"),
+        BotCommand("ban", "Ban a user"),
+        BotCommand("unban", "Unban a user"),
+        BotCommand("ping", "Is the bot alive?"),
+        BotCommand("sent", "Send a message/file to a user"),
+        BotCommand("addpremium", "Give premium to a user"),
+        BotCommand("delpremium", "Remove premium"),
+        BotCommand("premiums", "List premium users"),
+        BotCommand("requests", "Most requested movies"),
+    ]
+    owner_cmds = admin_cmds + [
+        BotCommand("addadmin", "Add an admin"),
+        BotCommand("deladmin", "Remove an admin"),
+        BotCommand("del", "Delete a file from the database"),
+        BotCommand("dbset", "Set the database channel"),
+    ]
     try:
-        await app.set_bot_commands(USER_COMMANDS)
+        await app.set_bot_commands(user_cmds)
         for admin in ALL_ADMINS:
             try:
-                cmds = OWNER_COMMANDS if admin in ADMINS else ADMIN_COMMANDS
+                cmds = owner_cmds if admin in ADMINS else admin_cmds
                 await app.set_bot_commands(cmds, scope=BotCommandScopeChat(admin))
             except Exception:
                 pass  # may fail if the admin hasn't started the bot yet
@@ -2669,6 +3325,7 @@ async def main():
     if hasattr(store, "notify"):
         store.notify = notify_admins  # tells admins when a MongoDB gets full
     await load_admins()
+    await load_premium()
     BANNED.update(int(x) for x in (await store.get_meta("banned", "")).split() if x.lstrip("-").isdigit())
     saved_db = await store.get_meta("db_channel", "")
     if saved_db.lstrip("-").isdigit():
@@ -2688,10 +3345,16 @@ async def main():
     log.info("Force-join channels: %s", [c["ref"] for c in await get_force_channels()])
     log.info("Auto-forward source groups: %s", SOURCE_GROUPS or "none")
     log.info("Database: %s", "MongoDB" if store.persistent else "SQLite")
+    log.info(
+        "Movie info: posters %s | exact name first %s | related results %s | premium users %s | free daily limit %s",
+        "on" if POSTER_ON_SEARCH else "off", "on" if EXACT_FIRST else "off",
+        "on" if FUZZY_SEARCH else "off", len(PREMIUM), FREE_DAILY_LIMIT or "none",
+    )
     await set_menu_commands()
     if AUTO_INDEX_ON_START:
         asyncio.create_task(_startup_scan())
     await idle()
+    await moviedb.close()
     await app.stop()
 
 

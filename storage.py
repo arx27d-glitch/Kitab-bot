@@ -2,25 +2,20 @@
 
 MongoStore  -> MongoDB (restart ke baad bhi data bacha rehta hai, RECOMMENDED)
 SqliteStore -> local file (sirf test / VPS ke liye; Heroku/Railway/Render par restart me mit sakti hai)
-
-Search = WHOLE WORDS (word-start match): "man" finds "Man of Steel" but NOT "Batman".
 """
 import asyncio
 import logging
 import re
 import sqlite3
+import time
 from typing import List, Optional, Tuple
 
 log = logging.getLogger("bookbot.storage")
 
 
 def _like(word: str) -> str:
-    """LIKE pattern: the word must START a word of the search text. % and _ typed by a user are NOT wildcards."""
-    return "% " + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-
-
-def _regex(word: str) -> dict:
-    return {"$regex": r"(?:^|\s)" + re.escape(word)}
+    """LIKE pattern for a word; % and _ typed by a user are NOT wildcards."""
+    return "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
 class SqliteStore:
@@ -37,6 +32,8 @@ class SqliteStore:
             CREATE TABLE IF NOT EXISTS forwarded(uid TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS channels(slot INTEGER PRIMARY KEY, ref TEXT, link TEXT);
+            CREATE TABLE IF NOT EXISTS requests(
+                uid INTEGER, q TEXT, raw TEXT, ts REAL, PRIMARY KEY(uid, q));
             """
         )
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(files)")}
@@ -69,23 +66,22 @@ class SqliteStore:
         return cur.rowcount
 
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
-        """Every word must be found (at the start of a word)."""
         if not words:
             return []
         sql = (
             "SELECT msg_id, title, size FROM files WHERE "
-            + " AND ".join(["(' ' || search) LIKE ? ESCAPE '\\'"] * len(words))
+            + " AND ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
             + " ORDER BY title LIMIT 2000"
         )
         return [tuple(r) for r in self.db.execute(sql, [_like(w) for w in words]).fetchall()]
 
     async def find_any(self, words: List[str], limit: int = 200) -> List[Tuple[int, str, int]]:
-        """At least one word matches; files with more matching words come first."""
+        """Kam se kam ek word match kare; jyada words match wale pehle."""
         if not words:
             return []
         like = [_like(w) for w in words]
-        score = " + ".join(["((' ' || search) LIKE ? ESCAPE '\\')"] * len(words))
-        where = " OR ".join(["(' ' || search) LIKE ? ESCAPE '\\'"] * len(words))
+        score = " + ".join(["(search LIKE ? ESCAPE '\\')"] * len(words))
+        where = " OR ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
         sql = (
             f"SELECT msg_id, title, size FROM files WHERE {where} "
             f"ORDER BY ({score}) DESC, title LIMIT {int(limit)}"
@@ -149,6 +145,27 @@ class SqliteStore:
         self.db.execute("DELETE FROM channels WHERE slot=?", (slot,))
         self.db.commit()
 
+    # movie requests (a user asks for a movie that is not in the library yet)
+    async def add_request(self, uid: int, q: str, raw: str, limit: int = 0) -> str:
+        """Returns 'ok', 'dup' (same user asked the same thing) or 'limit' (too many pending requests)."""
+        if self.db.execute("SELECT 1 FROM requests WHERE uid=? AND q=?", (uid, q)).fetchone():
+            return "dup"
+        if limit:
+            n = self.db.execute("SELECT COUNT(*) FROM requests WHERE uid=?", (uid,)).fetchone()[0]
+            if n >= limit:
+                return "limit"
+        self.db.execute("INSERT OR REPLACE INTO requests VALUES(?,?,?,?)", (uid, q, raw, time.time()))
+        self.db.commit()
+        return "ok"
+
+    async def all_requests(self) -> List[Tuple[int, str, str]]:
+        rows = self.db.execute("SELECT uid, q, raw FROM requests ORDER BY ts LIMIT 5000").fetchall()
+        return [tuple(r) for r in rows]
+
+    async def delete_requests(self, pairs: List[Tuple[int, str]]):
+        self.db.executemany("DELETE FROM requests WHERE uid=? AND q=?", pairs)
+        self.db.commit()
+
 
 class MongoStore:
     persistent = True
@@ -188,25 +205,24 @@ class MongoStore:
         return res.deleted_count
 
     async def find(self, words: List[str]) -> List[Tuple[int, str, int]]:
-        """Every word must be found (at the start of a word)."""
         if not words:
             return []
-        conds = [{"search": _regex(w)} for w in words]
+        conds = [{"search": {"$regex": re.escape(w)}} for w in words]
         cur = self.db.files.find({"$and": conds}, {"title": 1, "size": 1}).sort("title", 1)
         docs = await cur.to_list(length=2000)
         return [(d["_id"], d.get("title", ""), d.get("size", 0)) for d in docs]
 
     async def find_any(self, words: List[str], limit: int = 200) -> List[Tuple[int, str, int]]:
-        """At least one word matches; files with more matching words come first."""
+        """Kam se kam ek word match kare; jyada words match wale pehle."""
         if not words:
             return []
-        conds = [{"search": _regex(w)} for w in words]
+        conds = [{"search": {"$regex": re.escape(w)}} for w in words]
         cur = self.db.files.find({"$or": conds}, {"title": 1, "size": 1, "search": 1}).limit(1000)
         docs = await cur.to_list(length=1000)
 
         def score(d):
-            text = " " + d.get("search", "")
-            return sum(1 for w in words if " " + w in text)
+            text = d.get("search", "")
+            return sum(1 for w in words if w in text)
 
         docs.sort(key=lambda d: (-score(d), d.get("title", "")))
         return [(d["_id"], d.get("title", ""), d.get("size", 0)) for d in docs[:limit]]
@@ -266,6 +282,29 @@ class MongoStore:
     async def del_channel(self, slot: int):
         await self.db.channels.delete_one({"_id": slot})
 
+    # movie requests (a user asks for a movie that is not in the library yet)
+    async def add_request(self, uid: int, q: str, raw: str, limit: int = 0) -> str:
+        """Returns 'ok', 'dup' (same user asked the same thing) or 'limit' (too many pending requests)."""
+        rid = f"{uid}|{q}"
+        if await self.db.requests.find_one({"_id": rid}):
+            return "dup"
+        if limit and await self.db.requests.count_documents({"uid": uid}) >= limit:
+            return "limit"
+        await self.db.requests.replace_one(
+            {"_id": rid},
+            {"_id": rid, "uid": uid, "q": q, "raw": raw, "ts": time.time()},
+            upsert=True,
+        )
+        return "ok"
+
+    async def all_requests(self) -> List[Tuple[int, str, str]]:
+        cur = self.db.requests.find({}, {"uid": 1, "q": 1, "raw": 1}).sort("ts", 1).limit(5000)
+        return [(d["uid"], d.get("q", ""), d.get("raw", "")) async for d in cur]
+
+    async def delete_requests(self, pairs: List[Tuple[int, str]]):
+        if pairs:
+            await self.db.requests.delete_many({"_id": {"$in": [f"{u}|{q}" for u, q in pairs]}})
+
 
 # ----------------------------------------------------------------------------
 # MULTI MONGODB: 1 se 10 tak MongoDB. Jo bhar jaye uske baad files agle DB me jati hain.
@@ -287,7 +326,7 @@ class MultiMongoStore:
     - When a database reaches the size limit (or Mongo says "over quota"), it is marked full and
       the next one is used. Admins get a message about it.
     - Search / count / delete look in ALL databases, so the user never notices the split.
-    - Users, channels, admins, settings (small data) live in DB 1 only.
+    - Users, channels, admins, settings, movie requests (small data) live in DB 1 only.
     """
 
     persistent = True
@@ -304,7 +343,7 @@ class MultiMongoStore:
         self.notify = None  # optional: async function(text) set by the bot to message admins
 
     def __getattr__(self, name):
-        # users / meta / channels / forwarded etc. are handled by the first database
+        # users / meta / channels / forwarded / requests etc. are handled by the first database
         if name == "stores":
             raise AttributeError(name)
         return getattr(self.stores[0], name)
@@ -442,8 +481,8 @@ class MultiMongoStore:
         merged = await self._all(lambda st: st.find_any(words, limit))
 
         def score(r):
-            t = " " + (r[1] or "").lower()
-            return sum(1 for w in words if " " + w in t)
+            t = (r[1] or "").lower()
+            return sum(1 for w in words if w in t)
 
         merged.sort(key=lambda r: (-score(r), r[1]))
         return merged[:limit]
