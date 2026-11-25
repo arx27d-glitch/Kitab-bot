@@ -35,6 +35,7 @@ from pyrogram.types import (
 from i18n import LANGS, detect_lang, tr
 import i18n_extra  # noqa: F401  (adds the texts of the new features to i18n)
 import moviedb
+import trendlists  # 3:4 posters + trending sections
 from quality import LANG_NAMES, LANG_ORDER, ORDER as QUALITY_ORDER, file_meta
 from translit import phonetic_rank, to_latin
 from storage import MongoStore, MultiMongoStore, SqliteStore
@@ -2206,7 +2207,7 @@ async def dbset_cb(client: Client, cq: CallbackQuery):
     await store.set_meta("last_scanned", "0")
     await edit(
         cq.message,
-        "⏳ <b>Database channel changed.</b>\n" + LINE + f"\n¤ New: <code>{DB_CHANNEL}</code>\nScanning the channel, please wait...".replace("⏳", "◇"),
+        "◇ <b>Database channel changed.</b>\n" + LINE + f"\n¤ New: <code>{DB_CHANNEL}</code>\nScanning the channel, please wait...",
     )
     await cq.answer("Saved ✓")
     task = asyncio.create_task(_scan_after_dbset(cq.message))
@@ -2502,15 +2503,14 @@ def info_keyboard(info: dict, lang: str = "en"):
 
 
 async def reply_with_poster(target: Message, poster: str, text: str, kb, quote: bool = True):
-    """Replies with the poster and the text as its caption. If the poster can't be sent: only the text."""
+    """Replies with the poster (cut to 3:4) and the text as its caption. If the poster can't be sent: only the text."""
     if poster and plain_len(text) <= 1024:
         for attempt in (0, 1):
             try:
-                photo = poster
-                if attempt == 1:  # Telegram could not fetch the url: download it here and upload it
-                    photo = await moviedb.fetch_image(poster)
-                    if not photo:
-                        break
+                # attempt 0: our own 3:4 picture (trendlists.poster_34). attempt 1: the plain url as a fallback
+                photo = await trendlists.poster_34(poster) if attempt == 0 else poster
+                if not photo:
+                    continue
                 return await target.reply_photo(photo, caption=text, reply_markup=kb, quote=quote)
             except FloodWait:
                 raise
@@ -2582,48 +2582,71 @@ async def info_find_cb(client: Client, cq: CallbackQuery):
 
 
 # ----------------------------------------------------------------------------
-# TRENDING: popular movies / series / top rated (Cinemeta lists). Tapping a title searches the library.
+# TRENDING: sections (Bollywood / Hollywood / South / Other-wood / series / genres), see trendlists.py
+# Tapping a title searches the library.
 # ----------------------------------------------------------------------------
-TREND_LISTS = {
-    "pm": ("movie", "top", "b_popmovies"),
-    "ps": ("series", "top", "b_popseries"),
-    "pt": ("movie", "imdbRating", "b_toprated"),
+TREND_PER_PAGE = 10
+TREND_ROWS = [["bm", "hm"], ["sm", "om"], ["bs", "hs"], ["os", "nw"], ["pm", "ps"], ["tm", "ts"]]
+TREND_SHORTCUTS = {
+    "bollywood": "bm", "hollywood": "hm", "south": "sm", "otherwood": "om",
+    "hindiseries": "bs", "englishseries": "hs", "newreleases": "nw",
 }
-TREND_PER_PAGE = 8
 
 
 def trend_menu_view(lang: str):
     text = f"✦ <b>{tr(lang, 'trend_title')}</b>\n{LINE}\n♤ {tr(lang, 'trend_pick')}\n{LINE}"
-    kb = InlineKeyboardMarkup(
-        [
-            [btn(f"☆ {tr(lang, 'b_popmovies')}", BLUE, callback_data="tl|pm|0")],
-            [btn(f"♧ {tr(lang, 'b_popseries')}", BLUE, callback_data="tl|ps|0")],
-            [btn(f"★ {tr(lang, 'b_toprated')}", GREEN, callback_data="tl|pt|0")],
-            [InlineKeyboardButton(f"□ {tr(lang, 'b_home')}", callback_data="home")],
-        ]
-    )
-    return text, kb
+    rows = []
+    for pair in TREND_ROWS:
+        rows.append(
+            [
+                btn(
+                    f"{trendlists.ICONS[k]} {tr(lang, 'c_' + k)}",
+                    BLUE if k in ("bm", "hm") else None,
+                    callback_data=f"tl|{k}|0",
+                )
+                for k in pair
+            ]
+        )
+    rows.append([btn(f"🎭 {tr(lang, 'c_gn')}", GREEN, callback_data="tg")])
+    rows.append([InlineKeyboardButton(f"□ {tr(lang, 'b_home')}", callback_data="home")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def trend_genre_view(lang: str):
+    text = f"🎭 <b>{tr(lang, 'c_gn')}</b>\n{LINE}\n♤ {tr(lang, 'trend_pick')}\n{LINE}"
+    buttons = [
+        InlineKeyboardButton(tr(lang, "g_" + g), callback_data=f"tl|g_{g}|0") for g in trendlists.GENRES
+    ]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="trend")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def trend_list_view(key: str, page: int, lang: str):
-    kind, catalog, label = TREND_LISTS[key]
-    items = await moviedb.trending(kind, catalog)
+    items = await trendlists.get_category(key)
     if not items:
         return None, None
+    genre = key.startswith("g_")
+    label = f"{tr(lang, 'c_gn')} · {tr(lang, 'g_' + key[2:])}" if genre else tr(lang, "c_" + key)
+    icon = "🎭" if genre else trendlists.ICONS[key]
     pages = max(math.ceil(len(items) / TREND_PER_PAGE), 1)
     page = min(max(page, 0), pages - 1)
     start = page * TREND_PER_PAGE
-    text = (
-        f"✦ <b>{tr(lang, label)}</b>\n{LINE}\n□ {tr(lang, 'page')} <b>{page + 1}/{pages}</b>\n{LINE}\n"
-        f"▼ {tr(lang, 'trend_tap')}"
-    )
+    text = f"{icon} <b>{esc(label)}</b>\n{LINE}\n"
+    if key in ("sm", "om", "os"):
+        text += f"◇ <i>{tr(lang, 'd_' + key)}</i>\n"
+    if pages > 1:
+        text += f"□ {tr(lang, 'page')} <b>{page + 1}/{pages}</b>\n"
+    text += f"{LINE}\n▼ {tr(lang, 'trend_tap')}"
     rows = []
     for i, it in enumerate(items[start:start + TREND_PER_PAGE], start + 1):
-        name = f"{i}. {it['title'][:30]}"
+        name = f"{i}. {it['title'][:26]}"
         if it.get("year"):
             name += f" ({it['year']})"
         if it.get("rating"):
             name += f" ★{it['rating']}"
+        if key in trendlists.SHOW_LANG and it.get("lang"):
+            name += f" [{it['lang'].title()[:8]}]"
         rows.append([InlineKeyboardButton(name[:60], callback_data=f"ts|{it['id']}")])
     if pages > 1:
         nav = []
@@ -2633,8 +2656,25 @@ async def trend_list_view(key: str, page: int, lang: str):
         if page < pages - 1:
             nav.append(InlineKeyboardButton("»", callback_data=f"tl|{key}|{page + 1}"))
         rows.append(nav)
-    rows.append([InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="trend")])
+    rows.append([InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="tg" if genre else "trend")])
     return text, InlineKeyboardMarkup(rows)
+
+
+async def _show_trend_list(key: str, lang: str, send, edit_msg=None):
+    """Loads a section (with a 'loading' note on the first load) and shows it."""
+    wait = edit_msg
+    if not trendlists.is_cached(key) and wait is None:
+        wait = await send(f"◇ <b>{tr(lang, 'trend_loading')}</b>", None)
+    elif not trendlists.is_cached(key):
+        await edit(wait, f"◇ <b>{tr(lang, 'trend_loading')}</b>", None)
+    text, kb = await trend_list_view(key, 0, lang)
+    if not text:
+        text = f"▲ {tr(lang, 'trend_fail')}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"« {tr(lang, 'b_back')}", callback_data="trend")]])
+    if wait is not None:
+        await edit(wait, text, kb)
+        return wait
+    return await send(text, kb)
 
 
 @app.on_message(filters.command(["trending", "popular"]) & user_place)
@@ -2648,6 +2688,24 @@ async def trending_cmd(client: Client, m: Message):
     schedule_delete(reply, m)
 
 
+@app.on_message(filters.command(list(TREND_SHORTCUTS)) & user_place)
+@safe
+async def trend_shortcut_cmd(client: Client, m: Message):
+    """/bollywood /hollywood /south /otherwood /hindiseries /englishseries /newreleases"""
+    if not m.from_user or not await gate(client, m, m.from_user):
+        return
+    key = TREND_SHORTCUTS.get(m.command[0].lower().split("@")[0])
+    if not key:
+        return
+    lang = await lang_of(m.from_user)
+
+    async def send(text, kb):
+        return await m.reply(text, reply_markup=kb, quote=True)
+
+    reply = await _show_trend_list(key, lang, send)
+    schedule_delete(reply, m)
+
+
 @app.on_callback_query(filters.regex(r"^trend$"))
 @safe
 async def trend_cb(client: Client, cq: CallbackQuery):
@@ -2657,14 +2715,25 @@ async def trend_cb(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
+@app.on_callback_query(filters.regex(r"^tg$"))
+@safe
+async def trend_genre_cb(client: Client, cq: CallbackQuery):
+    lang = await lang_of(cq.from_user)
+    text, kb = trend_genre_view(lang)
+    await edit(cq.message, text, kb)
+    await cq.answer()
+
+
 @app.on_callback_query(filters.regex(r"^tl\|"))
 @safe
 async def trend_list_cb(client: Client, cq: CallbackQuery):
     _, key, page = cq.data.split("|")
-    if key not in TREND_LISTS or not page.isdigit():
+    if not trendlists.valid(key) or not page.isdigit():
         return await cq.answer()
     lang = await lang_of(cq.from_user)
     await cq.answer()  # the list may need a moment to load
+    if not trendlists.is_cached(key):
+        await edit(cq.message, f"◇ <b>{tr(lang, 'trend_loading')}</b>", None)
     text, kb = await trend_list_view(key, int(page), lang)
     if not text:
         text = f"▲ {tr(lang, 'trend_fail')}"
@@ -2676,7 +2745,8 @@ async def trend_list_cb(client: Client, cq: CallbackQuery):
 @safe
 async def trend_search_cb(client: Client, cq: CallbackQuery):
     lang = await lang_of(cq.from_user)
-    item = moviedb.find_trending(cq.data.split("|", 1)[1])
+    item_id = cq.data.split("|", 1)[1]
+    item = trendlists.find_item(item_id) or moviedb.find_trending(item_id)
     if not item:
         return await cq.answer(tr(lang, "a_expired"), show_alert=True)
     await cq.answer()
@@ -2888,7 +2958,8 @@ def not_found_text(query: str, lang: str = "en", info: dict = None) -> str:
         [
             "start", "help", "stats", "broadcast", "addchannel", "delchannel", "channels", "index",
             "addadmin", "deladmin", "admins", "setstart", "delstart", "del", "dbset", "sent", "language", "search", "s", "movie", "diag", "addgroup", "delgroup", "groups", "logs", "ban", "unban", "banned", "ping",
-            "info", "trending", "popular", "request", "requests", "myplan", "addpremium", "delpremium", "premiums",
+            "info", "trending", "popular", "bollywood", "hollywood", "south", "otherwood", "hindiseries",
+            "englishseries", "newreleases", "request", "requests", "myplan", "addpremium", "delpremium", "premiums",
         ]
     )
 )
@@ -3298,7 +3369,10 @@ async def set_menu_commands():
         BotCommand("language", "Change language"),
         BotCommand("search", "Search a movie: /search name"),
         BotCommand("info", "Poster, rating and plot: /info name"),
-        BotCommand("trending", "Popular movies and series"),
+        BotCommand("trending", "Bollywood, Hollywood, South, series ..."),
+        BotCommand("bollywood", "Bollywood top 10"),
+        BotCommand("hollywood", "Hollywood top 10"),
+        BotCommand("south", "South Indian top 10"),
         BotCommand("request", "Request a movie: /request name"),
         BotCommand("myplan", "My plan and downloads"),
     ]
@@ -3390,7 +3464,9 @@ async def main():
         "on" if POSTER_ON_SEARCH else "off", "on" if EXACT_FIRST else "off",
         "on" if FUZZY_SEARCH else "off", len(PREMIUM), FREE_DAILY_LIMIT or "none",
     )
+    log.info("NEW VERSION LOADED: 3:4 posters + trending sections (Bollywood/Hollywood/South/...)")
     await set_menu_commands()
+    asyncio.create_task(trendlists.warm())  # load the trending lists in the background
     if AUTO_INDEX_ON_START:
         asyncio.create_task(_startup_scan())
     await idle()
