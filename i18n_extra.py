@@ -3,7 +3,23 @@
 English + Hindi are written here. Every other language automatically falls back to English
 (see tr() in i18n.py), so nothing breaks. To translate, copy a T["xx"].update(...) block below.
 """
+import logging
+
 from i18n import T
+
+log = logging.getLogger("bookbot.i18n")
+
+
+class _English(dict):
+    """Safety net: a missing English text must never crash a command.
+    It is written to the log (so /logs shows it) and the key itself is shown instead of the text."""
+
+    def __missing__(self, key):
+        log.warning("Missing text key %r - add it to i18n.py / i18n_extra.py", key)
+        return str(key)
+
+
+T["en"] = _English(T["en"])
 
 T["en"].update(
     dict(
@@ -25,6 +41,15 @@ T["en"].update(
         trend_title="Trending Now", trend_pick="Pick a list",
         trend_tap="Tap a title to search it in the bot",
         trend_fail="The list is not available right now, please try again later.",
+        trend_loading="Loading the list, please wait...",
+        # trending sections (menu buttons + list headings)
+        c_bm="Bollywood", c_hm="Hollywood", c_sm="South Indian", c_om="Other-wood",
+        c_bs="Indian Series", c_hs="English Series", c_os="Other Series", c_nw="New Releases",
+        c_pm="Popular Movies", c_ps="Popular Series", c_tm="Top Rated Movies", c_ts="Top Rated Series",
+        c_gn="Genres",
+        d_sm="Tamil, Telugu, Malayalam, Kannada",
+        d_om="Korean, Japanese, Turkish, Punjabi, Bengali and more",
+        d_os="K-drama, anime, Turkish series and more",
         nf_req="Not in the library yet? You can request it below.",
         req_usage="Send the name: <code>/request Movie Name</code>",
         req_sent="Request saved! I will message you as soon as it is available.",
@@ -39,6 +64,13 @@ T["en"].update(
         plan_perks="Premium perks",
     )
 )
+
+# genre buttons (keys like "g_Sci-Fi" are not valid keyword names, so a normal dict is used)
+_GENRES = [
+    "Action", "Comedy", "Horror", "Thriller", "Romance", "Sci-Fi", "Animation", "Crime",
+    "Drama", "Adventure", "Fantasy", "Mystery", "Family", "War", "Biography", "Documentary",
+]
+T["en"].update({f"g_{g}": g for g in _GENRES})
 
 T["hi"].update(
     dict(
@@ -60,6 +92,14 @@ T["hi"].update(
         trend_title="अभी ट्रेंडिंग", trend_pick="एक लिस्ट चुनें",
         trend_tap="बॉट में खोजने के लिए किसी टाइटल पर टैप करें",
         trend_fail="लिस्ट अभी उपलब्ध नहीं है, कृपया बाद में कोशिश करें।",
+        trend_loading="लिस्ट लोड हो रही है, कृपया रुकें...",
+        c_bm="बॉलीवुड", c_hm="हॉलीवुड", c_sm="साउथ इंडियन", c_om="अदर-वुड",
+        c_bs="इंडियन सीरीज़", c_hs="इंग्लिश सीरीज़", c_os="अन्य सीरीज़", c_nw="नई रिलीज़",
+        c_pm="पॉपुलर मूवीज़", c_ps="पॉपुलर सीरीज़", c_tm="टॉप रेटेड मूवीज़", c_ts="टॉप रेटेड सीरीज़",
+        c_gn="जॉनर",
+        d_sm="तमिल, तेलुगु, मलयालम, कन्नड़",
+        d_om="कोरियन, जापानी, टर्किश, पंजाबी, बंगाली और भी",
+        d_os="के-ड्रामा, एनीमे, टर्किश सीरीज़ और भी",
         nf_req="अभी लाइब्रेरी में नहीं है? नीचे से रिक्वेस्ट कर सकते हैं।",
         req_usage="नाम भेजें: <code>/request Movie Name</code>",
         req_sent="रिक्वेस्ट सेव हो गई! उपलब्ध होते ही मैं आपको मैसेज करूँगा।",
@@ -73,4 +113,13 @@ T["hi"].update(
         plan_exp="खत्म होगा", plan_days="{d} दिन बाकी", plan_today="आज के डाउनलोड", plan_unl="अनलिमिटेड",
         plan_perks="प्रीमियम के फ़ायदे",
     )
+)
+
+T["hi"].update(
+    {
+        "g_Action": "एक्शन", "g_Comedy": "कॉमेडी", "g_Horror": "हॉरर", "g_Thriller": "थ्रिलर",
+        "g_Romance": "रोमांस", "g_Sci-Fi": "साई-फ़ाई", "g_Animation": "एनिमेशन", "g_Crime": "क्राइम",
+        "g_Drama": "ड्रामा", "g_Adventure": "एडवेंचर", "g_Fantasy": "फ़ैंटेसी", "g_Mystery": "मिस्ट्री",
+        "g_Family": "फ़ैमिली", "g_War": "वॉर", "g_Biography": "बायोग्राफ़ी", "g_Documentary": "डॉक्यूमेंट्री",
+    }
 )
