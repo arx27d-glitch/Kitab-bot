@@ -4,3 +4,4 @@ Unidecode>=1.3.8
 aiohttp>=3.9.5
 pyrotgfork==2.2.24.1
 tgcrypto==1.2.5
+Pillow>=10.0.0
